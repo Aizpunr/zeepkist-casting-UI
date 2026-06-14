@@ -94,7 +94,7 @@ COTDTracker mod to be running.
 ## Data (multi-comp)
 
 `overlay_pool.json` is **fetched live at launch** from
-`raw.githubusercontent.com/Aizpunr/Zeepkist-Lobby-Overlay/main/overlay_pool.json` (mirrors the
+`raw.githubusercontent.com/Aizpunr/zeepkist-casting-UI/main/overlay_pool.json` (mirrors the
 SoF mod), so published stats stay current without a mod update. A local `overlay_pool.json` next
 to the DLL is used as an offline/dev fallback until the fetch lands (applied on the main thread
 in `Update`, never mutated off the Unity thread). It is keyed by Steam ID and built by
@@ -154,8 +154,8 @@ build.bat
 Uses the Framework C# 5 `csc.exe` (no .NET SDK needed). Output `bin\LobbyOverlay.dll`,
 auto-copied with `overlay_pool.json` to `BepInEx\plugins\LobbyOverlay\` (the JSON for local/dev
 testing; the published release zip is DLL-only and fetches the pool from the repo). After
-regenerating the pool, push `overlay_pool.json` to the repo so live users get the new numbers.
-See `PUBLISH.md` for the full release steps and `MODIO_PAGE.md` for the listing copy.
+regenerating the pool, push `overlay_pool.json` to this repo so live users get the new numbers
+on their next launch.
 
 ## Rendering note
 
