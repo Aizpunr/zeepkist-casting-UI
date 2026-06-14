@@ -1,0 +1,5 @@
+bin/
+*.zip
+tools/
+__pycache__/
+*.pyc
