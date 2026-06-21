@@ -6,12 +6,16 @@ using System.Net;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using BepInEx;
+using BepInEx.Configuration;
 using BepInEx.Logging;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
 using ZeepSDK.Chat;
 using ZeepSDK.ChatCommands;
 using ZeepSDK.Controls;
+using ZeepSDK.Multiplayer;
+using ZeepSDK.PhotoMode;
+using ZeepSDK.Racing;
 using ZeepkistClient;
 
 namespace LobbyOverlay
@@ -20,7 +24,9 @@ namespace LobbyOverlay
     // Rendering is raw OnGUI() because only the C# 5 csc.exe is available on this
     // machine and ZeepSDK's Imui API is Span<char>-based (uncompilable here).
     // Pure local rendering: no server comms, no Update() traffic -> within mod rules.
-    [BepInPlugin("com.aizpun.lobbyoverlay", "Lobby Overlay", "1.0.0")]
+    // GUID changed from com.aizpun.lobbyoverlay before first publish (it locks on publish). The
+    // BepInEx config file is GUID-derived -> BepInEx/config/com.aizpun.tournamentcastingui.cfg.
+    [BepInPlugin("com.aizpun.tournamentcastingui", "Tournament Casting UI", "1.0.0")]
     [BepInDependency("ZeepSDK")]
     public class Plugin : BaseUnityPlugin, ILogListener
     {
@@ -66,7 +72,21 @@ namespace LobbyOverlay
         private CursorLockMode prevLock;
         private bool prevCursorVisible;
         private bool cursorSaved;
-        private float savedMouseSens = -1f;  // photomode MOUSE look sensitivity, zeroed while panel open
+        private float savedMouseSens = -1f;  // photomode MOUSE look sensitivity, zeroed while frozen
+        private bool mouseFreezeWarned;      // logged the "can't reach settings" warning once
+
+        // ---- Config (BepInEx; persists to BepInEx/config/com.aizpun.lobbyoverlay.cfg) ----
+        // Both default OFF. Mouse-look freeze is opt-in (it can fight the free-cam); stay-in-photomode
+        // only makes sense for a dedicated caster, never on for a racer.
+        private ConfigEntry<bool> cfgDisableMouseLook; // freeze mouse-look while the panel is open
+        private ConfigEntry<bool> cfgStayInPhotomode;  // auto re-enter photomode each round (server-gated)
+        private ConfigEntry<KeyCode> cfgKeyPanel;      // toggle the control panel (default F4)
+        private ConfigEntry<KeyCode> cfgKeyClear;      // clear everything (default F5)
+        private ConfigEntry<FollowCam> cfgFollowCamState; // photomode camera mode forced on left-click follow (None = leave alone)
+
+        // ---- Stay-in-photomode auto-enter ----
+        private EnableFlyingCamera2 efcRef;  // cached photomode toggle component
+        private bool stayEnterPending;       // a round just started: try to (re)enter photomode
 
         // ---- Photomode follow-camera link (bind the Stats card to who the camera follows) ----
         // FlyingCameraScript is only an active object while the fly/spectator camera is on, so its
@@ -81,7 +101,7 @@ namespace LobbyOverlay
         // Clear/off pause the camera auto-track until the camera moves to a DIFFERENT player
         // (or something is clicked); otherwise cam sync instantly repaints the card just cleared.
         private string clearHoldSid;         // sid held at Clear time ("" = was following nobody)
-        private bool camWasActive;           // fly-camera presence last poll (entry detection)
+        private bool inPhotoMode;            // event-driven (PhotoModeApi enter/exit); gates the cam/drone poll
         private bool holdArmPending;         // photomode just opened: hold its auto-picked target
 
         // ---- PhotoDrone bridge (optional Metalted mod; reflection so it stays a soft dep) ----
@@ -156,9 +176,10 @@ namespace LobbyOverlay
         private Color goodColor = new Color(0.55f, 1f, 0.6f);
         private Color dimColor = new Color(0.62f, 0.66f, 0.74f);
         private Color elimColor = new Color(1f, 0.42f, 0.42f);   // red: alive, no time yet
-        private Color bubbleColor = new Color(1f, 0.84f, 0.36f); // yellow: at risk (last N timed)
+        private Color bubbleColor = new Color(1f, 0.84f, 0.36f); // yellow: at risk (last N timed) / TyO in-danger
         private Color safeColor = new Color(0.90f, 0.92f, 0.96f);// white: safe
         private Color outColor = new Color(0.42f, 0.45f, 0.50f); // grey: eliminated from the cup
+        private Color lastLifeColor = new Color(1f, 0.55f, 0.15f);// orange: TyO last life (L:1)
         private Texture2D bgTex;
         // COTD site palette: amber accent for titles/lines, near-white default player names,
         // and per-player custom colours (cup winners) from the pool's "col" field.
@@ -197,6 +218,11 @@ namespace LobbyOverlay
         private static readonly string[] COMP_ORDER =
             { "cotd", "crosscomp", "pcdj", "eggy", "qube", "tyo", "kerki", "zsl" };
 
+        // Default photomode camera mode applied on a left-click follow. The integers are the game's
+        // own FlyingCameraScript.currentCameraState values; 6 is the dynamic/smooth follow (verified
+        // in-game via /overlay camstate). None = leave the caster's current camera mode alone.
+        private enum FollowCam { None = -1, State0 = 0, State1 = 1, State2 = 2, State3 = 3, State4 = 4, State5 = 5, DynamicFollow = 6, State7 = 7 }
+
         // [Comp] button: which cup FORMAT drives the player-list ordering logic (not the stats).
         private enum CastMode { Cup, Topout, Pursuit }
         private CastMode castMode = CastMode.Cup;
@@ -226,6 +252,24 @@ namespace LobbyOverlay
         private void Awake()
         {
             Instance = this;
+            cfgDisableMouseLook = Config.Bind("General", "Disable mouse look in photomode", false,
+                "Freezes photomode mouse-look (sets the mouse sensitivity to 0) while the overlay " +
+                "control panel is open, so you can click without swinging the camera. Controller look " +
+                "is unaffected. Off by default.");
+            cfgStayInPhotomode = Config.Bind("General", "Stay in photomode", false,
+                "Auto re-enters photomode at the start of each round (for casters/spectators). Respects " +
+                "the server's photomode rules and never forces it when a comp disables or gates " +
+                "photomode. Off by default.");
+            cfgKeyPanel = Config.Bind("Hotkeys", "Toggle panel", KeyCode.F4,
+                "Key to open/close the click-to-cast control panel.");
+            cfgKeyClear = Config.Bind("Hotkeys", "Clear overlay", KeyCode.F5,
+                "Key to clear everything on screen (same as the panel's Clear button).");
+            cfgFollowCamState = Config.Bind("Camera", "Follow camera mode", FollowCam.DynamicFollow,
+                "Camera mode to switch to when you LEFT-CLICK a player to follow. DynamicFollow (the " +
+                "smooth chase cam) is the default. None = leave the game's current camera mode alone. " +
+                "State0-State7 are the raw photomode camera states if you prefer a different one. The " +
+                "in-game camera keybinds still work to change it on the fly; this only sets the default " +
+                "applied on a click.");
             LoadPool();
             BuildAvailableComps();
             LoadLayout();
@@ -248,8 +292,25 @@ namespace LobbyOverlay
                     BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
             }
             catch (Exception ex) { Logger.LogError("UpdateZeepkistList lookup failed: " + ex); }
-            Logger.LogInfo(string.Format("Lobby Overlay 1.0.0-beta.1 loaded. Local pool v{0}, {1} players (refreshing from repo).",
+            // Casting integrity: leaving photomode force-clears the overlay (un-disableable) so a racer
+            // can't keep another player's cam/stats up. Round start re-arms the stay-in-photomode entry.
+            try
+            {
+                PhotoModeApi.PhotoModeEntered += OnPhotoModeEntered;
+                PhotoModeApi.PhotoModeExited += OnPhotoModeExited;
+                RacingApi.RoundStarted += OnRoundStarted;
+                RacingApi.RoundEnded += OnRoundEnded;
+                MultiplayerApi.DisconnectedFromGame += OnLeftLobby;
+                // Self-correct if we somehow load while already in photomode (events only fire on
+                // the transition). Best-effort: efc may be null this early, which is fine.
+                EnableFlyingCamera2 efc0 = FindEFC();
+                if (efc0 != null && efc0.isPhotoMode) inPhotoMode = true;
+            }
+            catch (Exception ex) { Logger.LogError("Photomode/racing hooks failed: " + ex); }
+            Logger.LogInfo(string.Format("Tournament Casting UI 1.0.0-beta.3 loaded. Local pool v{0}, {1} players (refreshing from repo).",
                 poolVersion, pool.Count));
+            Logger.LogInfo(string.Format("[config] Disable mouse look in photomode = {0}; Stay in photomode = {1}",
+                cfgDisableMouseLook.Value, cfgStayInPhotomode.Value));
         }
 
         // Load the local file immediately (offline/dev), then refresh from the repo (async).
@@ -366,6 +427,17 @@ namespace LobbyOverlay
                 ChatApi.AddLocalMessage("Overlay off.");
                 return;
             }
+            // Diagnostic: print the live photomode camera state so we can pin which value is the
+            // dynamic/smooth follow (the integers are unnamed). Must come before the "cam" prefix.
+            if (lower.StartsWith("camstate"))
+            {
+                FlyingCameraScript fc = GetFlyingCamera();
+                if (fc == null) ChatApi.AddLocalMessage("camstate: not in photomode (no fly camera).");
+                else ChatApi.AddLocalMessage(string.Format(
+                    "camstate: currentCameraState={0}, alternate={1}  (cycle cameras + re-run to find dynamic follow)",
+                    fc.currentCameraState, fc.alternateCameraState));
+                return;
+            }
             if (lower.StartsWith("cam"))
             {
                 string v = args.Substring(3).Trim().ToLowerInvariant();
@@ -377,6 +449,22 @@ namespace LobbyOverlay
                     ChatApi.AddLocalMessage("Camera sync " + (camLink ? "on." : "off."));
                 }
                 else ChatApi.AddLocalMessage("Camera sync is " + (camLink ? "on" : "off") + ". Usage: /overlay cam on|off");
+                return;
+            }
+            // Runtime toggles for the two BepInEx settings, so they work without a config-manager mod
+            // (still backed by the .cfg, so the choice persists across restarts).
+            if (lower.StartsWith("mouselock"))
+            {
+                bool? b = ParseOnOff(args.Substring("mouselock".Length));
+                if (b.HasValue) { cfgDisableMouseLook.Value = b.Value; ChatApi.AddLocalMessage("Disable mouse look in photomode: " + (b.Value ? "on" : "off")); }
+                else ChatApi.AddLocalMessage("Mouse-look freeze is " + (cfgDisableMouseLook.Value ? "on" : "off") + ". Usage: /overlay mouselock on|off");
+                return;
+            }
+            if (lower.StartsWith("staycam"))
+            {
+                bool? b = ParseOnOff(args.Substring("staycam".Length));
+                if (b.HasValue) { cfgStayInPhotomode.Value = b.Value; if (b.Value) stayEnterPending = true; ChatApi.AddLocalMessage("Stay in photomode: " + (b.Value ? "on" : "off")); }
+                else ChatApi.AddLocalMessage("Stay in photomode is " + (cfgStayInPhotomode.Value ? "on" : "off") + ". Usage: /overlay staycam on|off");
                 return;
             }
             if (lower == "test")
@@ -454,6 +542,13 @@ namespace LobbyOverlay
                 ChatApi.AddLocalMessage("Live cup times reset.");
                 return;
             }
+            if (lower == "resetpos" || lower == "resetwindows")
+            {
+                ResetPositions();
+                showPanel = true; // open so the drag grips are visible to re-place the boxes
+                ChatApi.AddLocalMessage("Overlay windows reset to default positions.");
+                return;
+            }
             if (lower.StartsWith("times"))
             {
                 string name = args.Substring(5).Trim();
@@ -468,7 +563,16 @@ namespace LobbyOverlay
                 ChatApi.AddLocalMessage("Times: " + key);
                 return;
             }
-            ChatApi.AddLocalMessage("Usage: /overlay panel (F4) | stats <name> | h2h <a> <b> | times <name> | pool <comp> | comp cup|topout|pursuit | cam on|off | reset | test | off");
+            ChatApi.AddLocalMessage("Usage: /overlay panel (F4) | stats <name> | h2h <a> <b> | times <name> | pool <comp> | comp cup|topout|pursuit | cam on|off | mouselock on|off | staycam on|off | camstate | reset | resetpos | test | off");
+        }
+
+        // Parse an on/off argument (also accepts 1/0, true/false). null = neither (show current state).
+        private static bool? ParseOnOff(string s)
+        {
+            s = (s ?? "").Trim().ToLowerInvariant();
+            if (s == "on" || s == "1" || s == "true") return true;
+            if (s == "off" || s == "0" || s == "false") return false;
+            return null;
         }
 
         // Split "alice bob" into two names. If both are single tokens this is trivial;
@@ -641,19 +745,25 @@ namespace LobbyOverlay
             eliminatedLive.Clear();
         }
 
-        // Is this lobby player already eliminated from the running cup? COTDTracker logs names
-        // without the clan tag, lobby names may carry one -> suffix match either way.
-        private bool IsOut(string lobbyName)
+        // Tag-tolerant match of a lobby name against a set of COTDTracker names (logged without the
+        // clan tag; lobby names may carry one) -> suffix match either way.
+        private static bool NameMatchesSet(string lobbyName, IEnumerable<string> names)
         {
-            if (eliminatedLive.Count == 0 || string.IsNullOrEmpty(lobbyName)) return false;
+            if (string.IsNullOrEmpty(lobbyName)) return false;
             string q = lobbyName.Trim().ToLowerInvariant();
-            foreach (string n in eliminatedLive)
+            foreach (string n in names)
             {
-                string e = n.ToLowerInvariant();
+                string e = (n ?? "").ToLowerInvariant();
                 if (e.Length < 3 || q.Length < 3) { if (e == q) return true; continue; }
                 if (e == q || q.EndsWith(e) || e.EndsWith(q)) return true;
             }
             return false;
+        }
+
+        // Is this lobby player already eliminated from the running cup?
+        private bool IsOut(string lobbyName)
+        {
+            return eliminatedLive.Count != 0 && NameMatchesSet(lobbyName, eliminatedLive);
         }
 
         // Resolve a typed name to a key in playerRoundTimes (names as COTDTracker logged them).
@@ -683,19 +793,38 @@ namespace LobbyOverlay
                 ApplyFetchedPool(j);
             }
 
-            // F4 toggles the control panel (no typing needed mid-cast).
-            try { if (Input.GetKeyDown(KeyCode.F4)) TogglePanel(); }
+            // F4 toggles the control panel (no typing needed mid-cast); F5 clears everything.
+            try
+            {
+                if (Input.GetKeyDown(cfgKeyPanel != null ? cfgKeyPanel.Value : KeyCode.F4)) TogglePanel();
+                if (Input.GetKeyDown(cfgKeyClear != null ? cfgKeyClear.Value : KeyCode.F5)) ClearAll();
+            }
             catch { }
 
-            // Keep the Stats card bound to whoever the photomode camera is following, and the
-            // compare drone alive/targeted (~5 Hz).
+            // Cursor save/restore is reconciled from showPanel every frame, so the saved state is
+            // restored the instant the panel closes by ANY path (F4, photomode exit, leaving the
+            // lobby) - this is what prevents a "lost mouse". OnGUI does the actual freeing.
+            try { ReconcileCursor(); }
+            catch { }
+
+            // Mouse-look freeze is reconciled every frame (cheap): the free-cam reads sensitivity
+            // each frame and the game re-reads its settings at round transitions, so a 5 Hz re-assert
+            // left ~200 ms windows where the camera still swung. Per-frame keeps it solid when on.
+            try { ReconcileMouseFreeze(); }
+            catch { }
+
+            // Keep the Stats card bound to whoever the photomode camera is following, the compare
+            // drone alive/targeted, and the stay-in-photomode auto-enter ticking (~5 Hz).
             try
             {
                 camPollAccum += Time.deltaTime;
                 if (camPollAccum >= 0.2f)
                 {
                     camPollAccum = 0f;
-                    PollCameraPresence(); PollCamera(); EnsureDrone(); ReassertMouseFreeze();
+                    // Camera/drone work only matters in photomode; gating it here means zero
+                    // FindObjectOfType scans and zero drone reflection while just racing.
+                    if (inPhotoMode) { PollCamera(); EnsureDrone(); }
+                    TryEnterPhotomode(); // must run ungated: its whole job is to ENTER photomode
                 }
             }
             catch { }
@@ -703,26 +832,26 @@ namespace LobbyOverlay
 
         private void TogglePanel()
         {
-            showPanel = !showPanel;
+            showPanel = !showPanel; // cursor save/restore is owned by ReconcileCursor (Update)
+        }
+
+        // Own the cursor lifecycle off a single source of truth (showPanel): save the game's cursor
+        // state when the panel opens, and ALWAYS restore it when the panel closes - no matter which
+        // path closed it. The freeing-while-open is done in OnGUI (latest in the frame, so it beats
+        // the game re-locking the cursor). Without this guaranteed restore a missed close path leaves
+        // the cursor freed = "lost mouse" (reported by Kilandor). Save runs before OnGUI's force
+        // because Update precedes OnGUI, so we capture the real state, not the freed one.
+        private void ReconcileCursor()
+        {
             if (showPanel)
             {
-                if (!cursorSaved)
-                {
-                    prevLock = Cursor.lockState;
-                    prevCursorVisible = Cursor.visible;
-                    cursorSaved = true;
-                }
-                FreezeMouseLook(true);
+                if (!cursorSaved) { prevLock = Cursor.lockState; prevCursorVisible = Cursor.visible; cursorSaved = true; }
             }
-            else
+            else if (cursorSaved)
             {
-                if (cursorSaved)
-                {
-                    Cursor.lockState = prevLock;
-                    Cursor.visible = prevCursorVisible;
-                    cursorSaved = false;
-                }
-                FreezeMouseLook(false);
+                Cursor.lockState = prevLock;
+                Cursor.visible = prevCursorVisible;
+                cursorSaved = false;
             }
         }
 
@@ -737,37 +866,47 @@ namespace LobbyOverlay
             try
             {
                 PlayerManager pm = PlayerManager.Instance;
-                if (pm == null || pm.instellingen == null) return;
-                GameSettingsScriptableObject s = pm.instellingen.Settings;
-                if (s == null) return;
+                GameSettingsScriptableObject s = (pm != null && pm.instellingen != null) ? pm.instellingen.Settings : null;
+                if (s == null)
+                {
+                    if (freeze && !mouseFreezeWarned)
+                    {
+                        mouseFreezeWarned = true;
+                        Logger.LogWarning("[mouselook] cannot freeze: PlayerManager/instellingen/Settings not reachable");
+                    }
+                    return;
+                }
                 if (freeze)
                 {
-                    if (savedMouseSens < 0f) savedMouseSens = s.photo_mode_sensitivity;
-                    s.photo_mode_sensitivity = 0f;
+                    if (savedMouseSens < 0f)
+                    {
+                        savedMouseSens = s.photo_mode_sensitivity;
+                        Logger.LogInfo(string.Format("[mouselook] freeze ON (mouse sensitivity {0} -> 0)", savedMouseSens));
+                    }
+                    s.photo_mode_sensitivity = 0f; // re-asserted each frame; LateUpdate reads this
                 }
                 else if (savedMouseSens >= 0f)
                 {
                     s.photo_mode_sensitivity = savedMouseSens;
+                    Logger.LogInfo(string.Format("[mouselook] freeze OFF (restored {0})", savedMouseSens));
                     savedMouseSens = -1f;
                 }
             }
-            catch { }
+            catch (Exception ex) { Logger.LogError("[mouselook] " + ex); }
         }
 
-        // The game can re-read its settings mid-session (round transitions), restoring the mouse
-        // sensitivity we zeroed and re-binding the camera to the mouse while the panel is open.
-        // Cheap 5 Hz re-assert keeps the freeze in force for as long as the panel is up.
-        private void ReassertMouseFreeze()
+        // Reconcile the mouse-look freeze every frame. When the setting is on we freeze for the WHOLE
+        // time we're in photomode (not just while the panel is open): the caster looks/flies with the
+        // controller and uses the mouse only to click, so a frozen mouse never swings the camera.
+        // FlyingCameraScript.LateUpdate reads photo_mode_sensitivity each frame (and runs after our
+        // Update), so this per-frame set is what keeps the freeze solid across the game re-reading its
+        // settings. FreezeMouseLook is idempotent (saves/restores once), so the restore branch also
+        // handles leaving photomode or toggling the setting off.
+        private void ReconcileMouseFreeze()
         {
-            if (!showPanel || savedMouseSens < 0f) return;
-            try
-            {
-                PlayerManager pm = PlayerManager.Instance;
-                if (pm == null || pm.instellingen == null) return;
-                GameSettingsScriptableObject s = pm.instellingen.Settings;
-                if (s != null && s.photo_mode_sensitivity != 0f) s.photo_mode_sensitivity = 0f;
-            }
-            catch { }
+            bool on = cfgDisableMouseLook != null && cfgDisableMouseLook.Value;
+            // inPhotoMode is event-driven, so this per-frame reconcile no longer needs a FindEFC.
+            FreezeMouseLook(on && inPhotoMode);
         }
 
         private void ToggleSel(string sid, string name)
@@ -848,6 +987,82 @@ namespace LobbyOverlay
             return fcRef;
         }
 
+        // The component that owns photomode (enter/exit + the server's can-enable rules). Cached;
+        // a destroyed Unity object compares == null, so we re-find on demand (same as the fly cam).
+        private EnableFlyingCamera2 FindEFC()
+        {
+            if (efcRef == null)
+            {
+                try { efcRef = (EnableFlyingCamera2)UnityEngine.Object.FindObjectOfType(typeof(EnableFlyingCamera2)); }
+                catch { efcRef = null; }
+            }
+            return efcRef;
+        }
+
+        // Photomode entered (ZeepSDK fires this off EnableFlyingCamera2.ToggleFlyingCamera). This is
+        // our authoritative "the fly/spectator camera is now active" signal, so the 5 Hz poll only
+        // does camera/drone work while this is true - no FindObjectOfType scans while racing. Arming
+        // holdArmPending here preserves the quiet-start that PollCameraPresence used to do on the
+        // camera-on transition; warm fcRef once now (one scan per photomode session, not per tick).
+        private void OnPhotoModeEntered()
+        {
+            inPhotoMode = true;
+            holdArmPending = true;
+            try { GetFlyingCamera(); } catch { }
+        }
+
+        // Casting integrity (un-disableable): leaving photomode force-clears the overlay so a racer
+        // can't keep another player's cam/stats on screen. Fired by ZeepSDK on every photomode exit.
+        // Drop the in-photomode flag (and the stale camera ref) BEFORE clearing so the poll stops
+        // touching the camera immediately.
+        private void OnPhotoModeExited()
+        {
+            inPhotoMode = false;
+            fcRef = null;
+            showPanel = false; // close the panel too; ReconcileCursor then restores the mouse for racing
+            try { ClearAll(); } catch { }
+        }
+
+        // Left the online lobby (disconnect / back to menu): wipe the whole overlay so nothing lingers
+        // into the menu or the next lobby - hide the panel + cards, drop the compare cam, clear the live
+        // leaderboard and cup state. Fired by ZeepSDK on every disconnect from a game.
+        private void OnLeftLobby()
+        {
+            inPhotoMode = false;
+            fcRef = null;
+            showPanel = false; // ReconcileCursor restores the mouse next frame
+            try { ClearAll(); } catch { }
+            try { board.Clear(); } catch { }
+            try { ResetLive(); } catch { }
+        }
+
+        // A round started: arm the stay-in-photomode (re)entry. The poll does the actual entering once
+        // the server permits it. Harmless when the setting is off (the poll early-outs).
+        // Clear the live leaderboard at round start so Cup mode begins with everyone timeless (red)
+        // until they actually post a time this round - the game may not push an empty board itself.
+        private void OnRoundStarted() { stayEnterPending = true; board.Clear(); }
+        private void OnRoundEnded() { stayEnterPending = false; }
+
+        // Stay-in-photomode: enter photomode as soon as the server allows, once per round, then leave
+        // the caster alone (a later manual exit is not re-fought because isPhotoMode clears pending).
+        // Gated by CanEnablePhotoMode so a comp that disables/finish-gates/time-gates photomode is
+        // respected and a racer is never force-entered - this is what keeps it within the mod rules.
+        private void TryEnterPhotomode()
+        {
+            if (cfgStayInPhotomode == null || !cfgStayInPhotomode.Value) { stayEnterPending = false; return; }
+            if (!stayEnterPending) return;
+            try
+            {
+                EnableFlyingCamera2 efc = FindEFC();
+                if (efc == null) return;                                   // scene not ready: keep pending
+                if (efc.isPhotoMode) { stayEnterPending = false; return; } // already in (any cause): done
+                if (!efc.CanEnablePhotoMode()) return;                     // server not allowing yet: retry
+                efc.ToggleFlyingCamera();                                  // enter (self-guarded too)
+                // pending clears next tick once isPhotoMode flips true (avoids a double toggle).
+            }
+            catch { }
+        }
+
         // Who the camera is following right now ("" when none) - used to arm the Clear hold.
         private string CurrentCameraSid()
         {
@@ -873,17 +1088,6 @@ namespace LobbyOverlay
             droneOn = false;
             EnsureDrone();                    // close the compare window right away
             clearHoldSid = CurrentCameraSid();
-        }
-
-        // Photomode starts quiet: turning the fly camera on auto-follows someone, which would
-        // instantly pop their card. Flag the entry; PollCamera captures the first followed sid
-        // as a hold, so nothing shows until the caster cycles away from it (or clicks the panel).
-        private void PollCameraPresence()
-        {
-            bool active = GetFlyingCamera() != null;
-            if (active && !camWasActive) holdArmPending = true;
-            if (!active) holdArmPending = false;
-            camWasActive = active;
         }
 
         // Drive the Stats card from the camera's followed player. Only runs in the "follow" path
@@ -955,6 +1159,15 @@ namespace LobbyOverlay
                     if (t != null && ReferenceEquals(t.ghost, ghost))
                     {
                         fc.currentTarget = t;
+                        // Force the default photomode camera mode (e.g. dynamic follow = state 6,
+                        // alternate off) on a click. None leaves the caster's chosen mode alone;
+                        // cycling with the game's own keys is never overridden (that path doesn't
+                        // come through here).
+                        if (cfgFollowCamState != null && cfgFollowCamState.Value != FollowCam.None)
+                        {
+                            fc.currentCameraState = (int)cfgFollowCamState.Value;
+                            fc.alternateCameraState = false;
+                        }
                         shownFollowSid = sidStr; // avoid an immediate poll override/flicker
                         return true;
                     }
@@ -1036,6 +1249,9 @@ namespace LobbyOverlay
             try
             {
                 if (!DroneApiReady()) return;
+                // Nothing to create and nothing to tear down -> skip the GetDrone reflection.
+                // (Teardown still runs when the toggle flips off, because droneRef is still set.)
+                if (!droneOn && droneRef == null) return;
                 bool want = droneOn && mode == Mode.H2H && target2 != null &&
                             !string.IsNullOrEmpty(target2.SteamId);
                 object drone = pdGetMI.Invoke(null, new object[] { DroneId });
@@ -1692,6 +1908,17 @@ namespace LobbyOverlay
             catch { }
         }
 
+        // Bring every draggable box back on-screen (recover one dragged off the edge and "lost").
+        // The x<0 sentinels make DrawPanel/DrawModeBar recompute their screen-relative defaults on the
+        // next draw; the card uses the fixed top-left default. Persisted so it survives a relaunch.
+        private void ResetPositions()
+        {
+            cardRect.x = 24f; cardRect.y = 130f;   // card: top-left
+            panelRect.x = -1f; panelRect.y = 130f; // panel: x<0 -> right side
+            barRect.x = -1f; barRect.y = 0f;       // mode bar: x<0 -> bottom-left
+            SaveLayout();
+        }
+
         private bool IsSelected(string sid)
         {
             for (int i = 0; i < selected.Count; i++)
@@ -1746,14 +1973,6 @@ namespace LobbyOverlay
                 ClearAll();
             GUILayout.EndHorizontal();
 
-            // Elimination count (drives the red/yellow zones). Auto-learned from COTDTracker.
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Elim/round:", labelStyle);
-            if (GUILayout.Button("-", buttonStyle, GUILayout.Width(Sc(30f))) && elimCount > 0) elimCount--;
-            GUILayout.Label(elimCount.ToString(), valueStyle, GUILayout.Width(Sc(26f)));
-            if (GUILayout.Button("+", buttonStyle, GUILayout.Width(Sc(30f)))) elimCount++;
-            GUILayout.EndHorizontal();
-
             // [Stats] = which comp's numbers the cards + H2H show. [Comp] = which cup format
             // orders the player list below. Left-click cycles forward, right-click back. Persisted.
             GUILayout.BeginHorizontal();
@@ -1802,7 +2021,7 @@ namespace LobbyOverlay
             GUILayout.EndArea();
         }
 
-        private enum PStatus { NoTime, Bubble, Safe, Out, NonRacer }
+        private enum PStatus { NoTime, Bubble, Safe, Out, NonRacer, Win, LastLife }
 
         private class PRow
         {
@@ -1811,6 +2030,7 @@ namespace LobbyOverlay
             public PStatus Status;
             public int Tier;
             public int Pos;
+            public float T;      // round time (seconds), for ordering finished racers fastest-first
             public float Elo;
             public bool InBoard; // has a live current-map leaderboard entry
             public bool HasTime; // ...and that entry is a valid (finished) time
@@ -1822,28 +2042,35 @@ namespace LobbyOverlay
             if (s == PStatus.NoTime) return elimColor;
             if (s == PStatus.Bubble) return bubbleColor;
             if (s == PStatus.Out) return outColor;
+            if (s == PStatus.Win) return goodColor; // green: crowned winner
+            if (s == PStatus.LastLife) return lastLifeColor; // orange: TyO last life
             return safeColor;
         }
 
-        // Dispatch the player-list ordering by the [Comp] casting mode. Pursuit is a placeholder
-        // (uses the Cup/leaderboard logic) until its own format is built.
+        // Dispatch the player-list ordering by the [Comp] casting mode (Cup / Topout / Pursuit).
         private List<PRow> BuildPanelRows()
         {
             List<ZeepkistNetworkPlayer> list = ZeepkistNetwork.PlayerList;
             if (list == null) return new List<PRow>();
             if (castMode == CastMode.Topout) return BuildTopoutRows(list);
+            if (castMode == CastMode.Pursuit) return BuildPursuitRows(list);
             return BuildCupRows(list);
         }
 
-        // Once the cup is decided, nuisances stop mattering and are dropped: a crowned winner
-        // exists, or the final roster of this many finalists is set.
-        private const int TopoutDropFinalists = 3;
+        // Once the finals start taking shape - a winner is crowned, or this many finalists are
+        // locked in - the nuisances stop being the show and drop off the list.
+        private const int TopoutNuisanceDropFinalists = 2;
 
-        // Topout casting order (aizpun's spec): finalists (FIN) yellow, everyone else white,
-        // winners at the bottom, all by championship points descending. Nuisances (eliminated but
-        // still blocking - worth casting, e.g. Maki) sit red at the very bottom while the cup is
-        // live, then drop once a winner or 3 finalists exist. Reads the game's native
-        // custom-leaderboard fields the host pushes, so it works for a non-host caster.
+        // Topout casting order (aizpun's spec), tuned for "click whoever you'd follow next",
+        // top -> bottom:
+        //   1. Nuisances (\o7): eliminated players still racing as blockers (e.g. Maki) - red,
+        //      pinned on TOP because a chaos-agent is exactly who you'd click... but only until
+        //      the finals take shape (a winner exists, or 2 finalists set), then they drop.
+        //   2. Finalists (FIN): topped out, locked into the finals - yellow.
+        //   3. Everyone else (the live points race): white, by championship points descending.
+        //   4. Winners (WIN): green, at the bottom, always kept (you may still want their runs).
+        // Reads the game's native custom-leaderboard fields the host pushes, so it works for a
+        // non-host caster.
         private List<PRow> BuildTopoutRows(List<ZeepkistNetworkPlayer> list)
         {
             EnsureTopoutApi();
@@ -1861,19 +2088,187 @@ namespace LobbyOverlay
                 r.Name = SafeName(p); if (r.Name == null) r.Name = "?";
                 Stat st; r.Elo = pool.TryGetValue(r.Sid, out st) ? st.Elo : 0f;
                 r.Points = ToChampPoints(p);
-                if (win) { winnerCount++; r.Tier = 1; r.Status = PStatus.Safe; rows.Add(r); }       // winners: white, bottom
-                else if (fin) { finalistCount++; r.Tier = 0; r.Status = PStatus.Bubble; rows.Add(r); } // finalists: yellow
-                else if (nui) { r.Tier = 2; r.Status = PStatus.NoTime; nuisances.Add(r); }            // nuisances: red, very bottom
-                else { r.Tier = 0; r.Status = PStatus.Safe; rows.Add(r); }                           // rest: white
+                if (win) { winnerCount++; r.Tier = 3; r.Status = PStatus.Win; rows.Add(r); }          // winners: green, bottom
+                else if (fin) { finalistCount++; r.Tier = 1; r.Status = PStatus.Bubble; rows.Add(r); } // finalists: yellow
+                else if (nui) { r.Tier = 0; r.Status = PStatus.NoTime; nuisances.Add(r); }            // nuisances: red, top (until finals form)
+                else { r.Tier = 2; r.Status = PStatus.Safe; rows.Add(r); }                            // rest: white, points race
             }
-            bool decided = winnerCount >= 1 || finalistCount >= TopoutDropFinalists;
-            if (!decided) rows.AddRange(nuisances);
+            bool finalsForming = winnerCount >= 1 || finalistCount >= TopoutNuisanceDropFinalists;
+            if (!finalsForming) rows.AddRange(nuisances);
             rows.Sort(delegate (PRow a, PRow b)
             {
                 if (a.Tier != b.Tier) return a.Tier.CompareTo(b.Tier);
                 return b.Points.CompareTo(a.Points); // championship points desc within tier
             });
             return rows;
+        }
+
+        // Pursuit (Tag You're Out) casting order. PursuitZK marks each player with a pursuer (who hunts
+        // them) and a target (who they hunt) by Steam ID; a player loses a life when their pursuer beats
+        // their time. List spec (aizpun): alive non-spectators only (eliminated dropped), ordered by the
+        // live round leaderboard fastest-first, colored ORANGE on the last life (L:1), else YELLOW when
+        // "in danger" (their pursuer has beaten their time this round), else WHITE. Falls back to the
+        // Cup/leaderboard logic when no PursuitZK tournament is running.
+        private List<PRow> BuildPursuitRows(List<ZeepkistNetworkPlayer> list)
+        {
+            List<PRow> tracked = BuildPursuitRowsFromTracker(list);
+            return tracked != null ? tracked : BuildCupRows(list);
+        }
+
+        private List<PRow> BuildPursuitRowsFromTracker(List<ZeepkistNetworkPlayer> list)
+        {
+            if (!EnsurePursuitApi()) return null;
+            try
+            {
+                System.Collections.IEnumerable parts = puParticipantsFI.GetValue(null) as System.Collections.IEnumerable;
+                if (parts == null) return null;
+                Dictionary<ulong, ZeepkistNetworkPlayer> byId = new Dictionary<ulong, ZeepkistNetworkPlayer>();
+                if (list != null) foreach (ZeepkistNetworkPlayer p in list) byId[p.SteamID] = p;
+
+                List<PRow> rows = new List<PRow>();
+                foreach (object pp in parts)
+                {
+                    if (pp == null) continue;
+                    if ((bool)puElimFI.GetValue(pp)) continue;  // eliminated -> drop
+                    if ((bool)puSpecFI.GetValue(pp)) continue;  // spectator -> drop
+                    ulong sid = (ulong)puSidFI.GetValue(pp);
+                    int lives = (int)puLivesFI.GetValue(pp);
+                    ulong pursuer = (ulong)puPursuerFI.GetValue(pp);
+                    PRow r = new PRow();
+                    r.Sid = sid.ToString(CultureInfo.InvariantCulture);
+                    r.Name = PursuitName(sid, byId);
+                    Stat st; r.Elo = pool.TryGetValue(r.Sid, out st) ? st.Elo : 0f;
+                    float myTime = GetRoundTime(sid);
+                    r.HasTime = myTime >= 0f;
+                    if (r.HasTime) r.T = myTime;
+                    // In danger = your pursuer has a time this round that beats yours (or you have none).
+                    float pTime = GetRoundTime(pursuer);
+                    bool inDanger = pTime >= 0f && (!r.HasTime || pTime < myTime);
+                    if (lives <= 1) r.Status = PStatus.LastLife;   // orange: one hit from out
+                    else if (inDanger) r.Status = PStatus.Bubble;  // yellow: about to lose a life
+                    else r.Status = PStatus.Safe;                  // white
+                    rows.Add(r);
+                }
+                if (rows.Count == 0) return null; // no active pursuit roster -> fall back
+                // Order strictly by the leaderboard: timed fastest-first, untimed at the bottom (elo desc).
+                rows.Sort(delegate (PRow a, PRow b)
+                {
+                    if (a.HasTime != b.HasTime) return a.HasTime ? -1 : 1;
+                    if (a.HasTime) return a.T.CompareTo(b.T);
+                    return b.Elo.CompareTo(a.Elo);
+                });
+                return rows;
+            }
+            catch { return null; }
+        }
+
+        // This round's finish time for a Steam ID from the live leaderboard, or -1 if none yet.
+        private float GetRoundTime(ulong sid)
+        {
+            try
+            {
+                LbEntry e;
+                if (board.TryGetValue(sid, out e)) { float t = ParseTime(e.Time); if (t >= 0f) return t; }
+            }
+            catch { }
+            return -1f;
+        }
+
+        // PursuitPlayer carries only a Steam ID; resolve a display name from the lobby roster, then the
+        // stats pool, then fall back to the raw id.
+        private string PursuitName(ulong sid, Dictionary<ulong, ZeepkistNetworkPlayer> byId)
+        {
+            ZeepkistNetworkPlayer p;
+            if (byId != null && byId.TryGetValue(sid, out p)) { string n = SafeName(p); if (!string.IsNullOrEmpty(n)) return n; }
+            Stat st;
+            if (pool.TryGetValue(sid.ToString(CultureInfo.InvariantCulture), out st) && !string.IsNullOrEmpty(st.Name)) return st.Name;
+            return sid.ToString(CultureInfo.InvariantCulture);
+        }
+
+        // ---- PursuitZK bridge (TyO roster + pursuer/target/lives by Steam ID; soft dep, reflection) ----
+        // PursuitTracker.pursuitParticipants is the live List<PursuitPlayer>; each carries steamID,
+        // livesRemaining, targetedBySteamID (pursuer), targetSteamID (target), eliminated, spectator.
+        // Replicated to every client (the mod Harmony-patches DrawIngameLeaderboard), so a non-host reads it.
+        private bool puChecked, puAvailable;
+        private FieldInfo puParticipantsFI; // static List<PursuitPlayer> PursuitTracker.pursuitParticipants
+        private FieldInfo puSidFI, puLivesFI, puPursuerFI, puTargetFI, puElimFI, puSpecFI;
+
+        private bool EnsurePursuitApi()
+        {
+            if (puChecked) return puAvailable;
+            puChecked = true;
+            try
+            {
+                Type ptT = null, ppT = null;
+                foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    if (a.GetName().Name != "PursuitZK") continue;
+                    ptT = a.GetType("PursuitTracker");
+                    ppT = a.GetType("PursuitPlayer");
+                    break;
+                }
+                if (ptT == null || ppT == null) return false;
+                BindingFlags sf = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+                puParticipantsFI = ptT.GetField("pursuitParticipants", sf);
+                BindingFlags inf = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                puSidFI = ppT.GetField("steamID", inf);
+                puLivesFI = ppT.GetField("livesRemaining", inf);
+                puPursuerFI = ppT.GetField("targetedBySteamID", inf);
+                puTargetFI = ppT.GetField("targetSteamID", inf); // used by the dual-cam (feature #2)
+                puElimFI = ppT.GetField("eliminated", inf);
+                puSpecFI = ppT.GetField("spectator", inf);
+                puAvailable = puParticipantsFI != null && puSidFI != null && puLivesFI != null &&
+                              puPursuerFI != null && puElimFI != null && puSpecFI != null;
+            }
+            catch { puAvailable = false; }
+            return puAvailable;
+        }
+
+        // ---- COTDTracker bridge (authoritative cup roster + elimination state; soft dep, reflection) ----
+        // CupPlayerTracker.CupPlayers is a static Dictionary<ulong steamID, CupPlayer> populated at cup
+        // start, so it is the exact "who is in the championship" set (round 1 included), SID-keyed - no
+        // name matching. Each CupPlayer carries isStillIn (not eliminated), hasFinished (timed this
+        // round) and Time. GetNumEliminations() is the live per-round elimination count.
+        private bool cotdChecked;
+        private bool cotdAvailable;
+        private FieldInfo cotdCupPlayersFI;   // static Dictionary<ulong, CupPlayer> CupPlayers
+        private FieldInfo cotdIsCupRunningFI; // static bool isCupRunning
+        private MethodInfo cotdNumElimMI;     // static int GetNumEliminations()
+        private FieldInfo cpSteamIdFI, cpNameFI, cpStillInFI, cpFinishedFI, cpTimeFI;
+
+        private bool EnsureCotdApi()
+        {
+            if (cotdChecked) return cotdAvailable;
+            cotdChecked = true;
+            try
+            {
+                Type cptT = null;
+                foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    if (a.GetName().Name != "COTDTracker") continue;
+                    cptT = a.GetType("COTDTracker.CupPlayerTracker");
+                    break;
+                }
+                if (cptT == null) return false;
+                BindingFlags sf = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+                cotdCupPlayersFI = cptT.GetField("CupPlayers", sf);
+                cotdIsCupRunningFI = cptT.GetField("isCupRunning", sf);
+                cotdNumElimMI = cptT.GetMethod("GetNumEliminations", sf, null, Type.EmptyTypes, null);
+                Type cpT = cptT.GetNestedType("CupPlayer", BindingFlags.Public | BindingFlags.NonPublic);
+                if (cpT != null)
+                {
+                    BindingFlags inf = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                    cpSteamIdFI = cpT.GetField("SteamID", inf);
+                    cpNameFI = cpT.GetField("Name", inf);
+                    cpStillInFI = cpT.GetField("isStillIn", inf);
+                    cpFinishedFI = cpT.GetField("hasFinished", inf);
+                    cpTimeFI = cpT.GetField("Time", inf);
+                }
+                cotdAvailable = cotdCupPlayersFI != null && cotdIsCupRunningFI != null && cotdNumElimMI != null &&
+                                cpSteamIdFI != null && cpStillInFI != null && cpFinishedFI != null && cpTimeFI != null;
+            }
+            catch { cotdAvailable = false; }
+            return cotdAvailable;
         }
 
         // ---- Topout native data (custom-leaderboard override text + championship points) ----
@@ -1929,68 +2324,126 @@ namespace LobbyOverlay
             return 0;
         }
 
-        // Cup casting order (COTD-style). Only players worth casting: eliminated players and
-        // spectators are dropped entirely.
-        //   1. RED    - alive, no time yet this round (most urgent for the caster)
-        //   2. YELLOW - alive with a time, in the last `elimCount` places (the bubble)
-        //   3. WHITE  - the rest of the alive racers, leaderboard order
-        // With no live leaderboard yet (fresh lobby / between cups) there's nothing to filter on,
-        // so every lobby player is shown by ELO - keeps the panel usable in plain lobbies.
+        // Cup casting order. The list IS COTDTracker's championship roster (everyone still in the cup,
+        // round 1 included), read straight from CupPlayerTracker.CupPlayers by SteamID - so spectators
+        // and the casting account, who are never in the cup, never appear, and eliminated players drop
+        // the instant COTDTracker marks them out. Tiers (lower = higher priority, shown first):
+        //   0 RED    - no time yet this round, OR (once everyone has posted) the slowest `elim` racers
+        //   1 YELLOW - the next `elim` up: on the bubble, at risk of being sniped
+        //   2 WHITE  - safe, shown by time (fastest first)
+        // When no COTDTracker cup is running (plain lobby), fall back to the live leaderboard.
         private List<PRow> BuildCupRows(List<ZeepkistNetworkPlayer> list)
         {
-            List<PRow> all = new List<PRow>();
-            int boardCount = 0;
+            List<PRow> tracked = BuildCupRowsFromTracker();
+            return tracked != null ? tracked : BuildCupRowsFallback(list);
+        }
+
+        // Authoritative path: COTDTracker's own roster + elimination state + per-round elim count.
+        // Returns null when there is no running cup to read, so the caller uses the lobby fallback.
+        private List<PRow> BuildCupRowsFromTracker()
+        {
+            if (!EnsureCotdApi()) return null;
+            try
+            {
+                if (!(bool)cotdIsCupRunningFI.GetValue(null)) return null;
+                System.Collections.IDictionary cps = cotdCupPlayersFI.GetValue(null) as System.Collections.IDictionary;
+                if (cps == null || cps.Count == 0) return null;
+                int x = 0;
+                try { x = (int)cotdNumElimMI.Invoke(null, null); } catch { }
+                if (x < 0) x = 0;
+
+                List<PRow> racers = new List<PRow>();
+                int finishedCount = 0;
+                foreach (object cp in cps.Values)
+                {
+                    if (cp == null) continue;
+                    if (!(bool)cpStillInFI.GetValue(cp)) continue; // eliminated from the cup -> drop
+                    PRow r = new PRow();
+                    ulong sid = (ulong)cpSteamIdFI.GetValue(cp);
+                    r.Sid = sid.ToString(CultureInfo.InvariantCulture);
+                    r.Name = (cpNameFI != null ? cpNameFI.GetValue(cp) as string : null) ?? "?";
+                    Stat st; r.Elo = pool.TryGetValue(r.Sid, out st) ? st.Elo : 0f;
+                    r.HasTime = (bool)cpFinishedFI.GetValue(cp);
+                    if (r.HasTime) { r.T = (float)cpTimeFI.GetValue(cp); finishedCount++; }
+                    racers.Add(r);
+                }
+                // Position the finished racers by time (fastest first); unfinished sink to the bottom.
+                List<PRow> finished = new List<PRow>();
+                foreach (PRow r in racers) if (r.HasTime) finished.Add(r);
+                finished.Sort(delegate (PRow a, PRow b) { return a.T.CompareTo(b.T); });
+                for (int i = 0; i < finished.Count; i++) finished[i].Pos = i + 1;
+                foreach (PRow r in racers) if (!r.HasTime) r.Pos = 99999;
+
+                ColorAndSortCupRows(racers, finishedCount, x);
+                return racers;
+            }
+            catch { return null; }
+        }
+
+        // Plain-lobby fallback (no COTDTracker cup): show everyone, timed from the live leaderboard.
+        private List<PRow> BuildCupRowsFallback(List<ZeepkistNetworkPlayer> list)
+        {
+            List<PRow> racers = new List<PRow>();
+            int timedCount = 0;
             foreach (ZeepkistNetworkPlayer p in list)
             {
                 PRow r = new PRow();
                 r.Sid = p.SteamID.ToString(CultureInfo.InvariantCulture);
                 r.Name = SafeName(p); if (r.Name == null) r.Name = "?";
+                if (IsOut(r.Name)) continue; // eliminated (if a cup was tracked earlier) -> drop
                 Stat st; r.Elo = pool.TryGetValue(r.Sid, out st) ? st.Elo : 0f;
                 LbEntry e;
-                r.InBoard = board.TryGetValue(p.SteamID, out e);
-                if (r.InBoard) { r.Pos = e.Position; r.HasTime = ParseTime(e.Time) >= 0f; boardCount++; }
+                if (board.TryGetValue(p.SteamID, out e) && ParseTime(e.Time) >= 0f)
+                { r.InBoard = true; r.HasTime = true; r.Pos = e.Position; timedCount++; }
                 else r.Pos = 99999;
-                all.Add(r);
+                racers.Add(r);
             }
+            ColorAndSortCupRows(racers, timedCount, elimCount > 0 ? elimCount : 0);
+            return racers;
+        }
 
-            // No leaderboard context: show everyone by ELO (plain lobby, pre-cup).
-            if (boardCount == 0)
+        // Shared red/yellow/white assignment + ordering (the user's spec). `timedCount` is how many of
+        // `racers` have a time; `x` is the elimination count. Rows must have Pos set (fastest = 1,
+        // unfinished = large) and HasTime/Elo populated.
+        private void ColorAndSortCupRows(List<PRow> racers, int timedCount, int x)
+        {
+            if (timedCount < racers.Count)
             {
-                all.Sort(delegate (PRow a, PRow b) { return b.Elo.CompareTo(a.Elo); });
-                foreach (PRow r in all) { r.Status = PStatus.Safe; r.Tier = 2; }
-                return all;
+                // Populating: no-time = RED, timed = WHITE. No bubble until the field is complete.
+                foreach (PRow r in racers)
+                {
+                    if (r.HasTime) { r.Status = PStatus.Safe; r.Tier = 2; }
+                    else { r.Status = PStatus.NoTime; r.Tier = 0; }
+                }
             }
-
-            // Cup running: keep only alive racers (in the board, not eliminated).
-            List<PRow> alive = new List<PRow>();
-            foreach (PRow r in all)
+            else if (x > 0)
             {
-                if (!r.InBoard || IsOut(r.Name)) continue; // spectator or eliminated -> drop
-                if (!r.HasTime) { r.Status = PStatus.NoTime; r.Tier = 0; }
-                alive.Add(r);
+                // Everyone timed: slowest x = RED (elim zone), next x up = YELLOW (at risk), rest WHITE.
+                racers.Sort(delegate (PRow a, PRow b) { return a.Pos.CompareTo(b.Pos); }); // fastest first
+                int total = racers.Count;
+                for (int i = 0; i < total; i++)
+                {
+                    int fromBottom = total - 1 - i; // 0 = slowest
+                    PRow r = racers[i];
+                    if (fromBottom < x) { r.Status = PStatus.NoTime; r.Tier = 0; }          // elimination zone
+                    else if (fromBottom < 2 * x) { r.Status = PStatus.Bubble; r.Tier = 1; } // at risk
+                    else { r.Status = PStatus.Safe; r.Tier = 2; }
+                }
             }
-
-            // The last `elimCount` of the alive TIMED racers are on the bubble (yellow).
-            List<PRow> timed = new List<PRow>();
-            foreach (PRow r in alive) if (r.HasTime) timed.Add(r);
-            timed.Sort(delegate (PRow a, PRow b) { return a.Pos.CompareTo(b.Pos); }); // best first
-            int n = elimCount > 0 ? elimCount : 0;
-            int tc = timed.Count;
-            for (int i = 0; i < tc; i++)
+            else
             {
-                PRow r = timed[i];
-                bool atRisk = n > 0 && (tc - 1 - i) < n;
-                r.Status = atRisk ? PStatus.Bubble : PStatus.Safe;
-                r.Tier = atRisk ? 1 : 2;
+                foreach (PRow r in racers) { r.Status = PStatus.Safe; r.Tier = 2; }
             }
 
-            alive.Sort(delegate (PRow a, PRow b)
+            // Tier first (red -> yellow -> white); within a tier timed players come first by position
+            // (fastest first), no-time players after them by ELO desc.
+            racers.Sort(delegate (PRow a, PRow b)
             {
                 if (a.Tier != b.Tier) return a.Tier.CompareTo(b.Tier);
-                if (a.Tier == 0) return b.Elo.CompareTo(a.Elo); // no time -> ELO desc
-                return a.Pos.CompareTo(b.Pos);                  // leaderboard order
+                if (a.HasTime != b.HasTime) return a.HasTime ? -1 : 1;
+                if (a.HasTime) return a.Pos.CompareTo(b.Pos);
+                return b.Elo.CompareTo(a.Elo);
             });
-            return alive;
         }
 
         private void DrawTimesCard(float x, float y, float w, string name)
@@ -2010,7 +2463,7 @@ namespace LobbyOverlay
             }
             else
             {
-                for (int i = 0; i < times.Count; i++)
+                for (int i = times.Count - 1; i >= 0; i--) // newest round first
                 {
                     string t = times[i].Time;
                     if (t != null) t = t.Replace(',', '.'); // logged with comma decimals
@@ -2379,6 +2832,15 @@ namespace LobbyOverlay
             try { BepInEx.Logging.Logger.Listeners.Remove(this); }
             catch { }
             UnsubscribeLeaderboard();
+            try
+            {
+                PhotoModeApi.PhotoModeEntered -= OnPhotoModeEntered;
+                PhotoModeApi.PhotoModeExited -= OnPhotoModeExited;
+                RacingApi.RoundStarted -= OnRoundStarted;
+                RacingApi.RoundEnded -= OnRoundEnded;
+                MultiplayerApi.DisconnectedFromGame -= OnLeftLobby;
+            }
+            catch { }
             try { FreezeMouseLook(false); } catch { } // restore mouse sensitivity if we zeroed it
             try { if (cursorSaved) { Cursor.lockState = prevLock; Cursor.visible = prevCursorVisible; } }
             catch { }

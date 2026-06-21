@@ -1,11 +1,11 @@
-# Lobby Overlay
+# Tournament Casting UI
 
 In-game stat cards for Zeepkist online lobbies, toggled by chat command. Shows the same
 kind of player info the COTD casting tool puts on stream (weighted ELO, peak, wins,
 podiums, cups, best finish), but rendered inside the game.
 
-Pool-based cards (Player Stats, Head-to-Head) plus a live per-round-times card. The inline
-leaderboard column is planned next.
+Pool-based cards (Player Stats, Head-to-Head), a live per-round-times card, and a click-to-cast
+control panel with a cup-aware player list (COTD elimination, Topout, and Pursuit / Tag You're Out).
 
 ## Commands
 
@@ -17,14 +17,18 @@ anywhere.
 **Control panel (no typing):** press **F4** (or `/overlay panel`) to open a click-to-cast
 panel listing the lobby players. **Left-click a player to follow** (camera + Stats card),
 **right-click to compare** (sets the H2H partner, keeping the followed player as the primary;
-right-click again to un-compare). "Clear" hides everything. While the panel is open the mouse
-cursor is freed so you can click (the mode bar and drag grips need the cursor free too); press
-F4 again to close it and return camera control.
+right-click again to un-compare). "Clear" (or **F5**) hides everything. While the panel is open
+the mouse cursor is freed so you can click (the mode bar and drag grips need the cursor free too);
+press F4 again to close it and return camera control (the current card stays up; F5 wipes it).
+The cursor's previous state is saved on open and always restored when the panel closes by any
+route (F4, leaving photomode, or leaving the lobby), so the mouse is never left stuck. Leaving
+photomode or the lobby also closes the panel and clears the overlay.
 
-The menu no longer freezes the camera: while it's open, only the **mouse** photomode look
-sensitivity is zeroed, so moving the mouse to click doesn't swing the camera — but you can
-**keep flying with a controller** (its own look sensitivity is untouched, and movement is never
-affected). Restored when you close the menu.
+Optional mouse-look freeze (off by default): with the **Disable mouse look in photomode** setting
+on (`/overlay mouselock on`), the **mouse** photomode look sensitivity is held at zero the whole
+time you're in photomode, so moving the mouse to click doesn't swing the camera — you look and
+fly with a **controller** instead (its own look sensitivity is untouched, and movement is never
+affected). Leave it off if you steer the camera with the mouse.
 
 **Moving things:** while the panel is open, each box (card, panel, mode bar) shows a small
 **grip square in its bottom-right corner** — drag from there to reposition. Positions are saved
@@ -37,15 +41,38 @@ Chat commands (still available):
 /overlay stats <name>          show one player's stat card (pinned; ignores camera)
 /overlay h2h <name1> <name2>   side-by-side comparison
 /overlay times <name>          per-round times for this cup (live)
+/overlay pool <comp>           which comp's numbers the cards show
+/overlay comp cup|topout|pursuit   which cup format orders the player list
 /overlay cam on|off            toggle the photomode follow-camera link
+/overlay mouselock on|off      disable mouse look in photomode (off by default)
+/overlay staycam on|off        auto re-enter photomode each round (off by default)
+/overlay camstate              print the live photomode camera state (diagnostic)
 /overlay reset                 clear live cup times (between cups)
+/overlay resetpos              move all overlay windows back on-screen (recover a lost one)
 /overlay test                  draw a fixed test card (no data needed)
 /overlay off                   hide
 ```
 
+**F5** clears everything on screen (same as the panel's Clear button). Settings live in the
+BepInEx config (`BepInEx/config/com.aizpun.tournamentcastingui.cfg`) and are also shown in
+ZeepSDK's in-game settings menu (ESC -> Settings), which renders each entry by type and gives the
+hotkeys a click-to-rebind. The `mouselock` / `staycam` chat commands flip those two live so no
+config-manager mod is required.
+
 Names are matched against the current lobby roster first (by Steam ID), then against the
 data pool by name. Partial names work (exact > prefix > contains). The `times` card matches
 against names seen live in the current cup.
+
+## Settings (BepInEx config / ESC -> Settings)
+
+- **Hotkeys** (`Toggle panel` = F4, `Clear overlay` = F5): rebindable `KeyCode` entries. Change
+  them in the config file or via ZeepSDK's settings menu (click the key, press the new bind).
+- **Camera -> Follow camera mode** (default `DynamicFollow`): which photomode camera the overlay
+  switches to when you **left-click** a player to follow. `None` leaves the camera mode alone;
+  `State0`-`State7` force a specific raw photomode state. The game's own camera keybinds still work
+  to change it on the fly; this only sets the default applied on a click. (`/overlay camstate`
+  prints the current state if you want to find a different one.)
+- **General**: `Disable mouse look in photomode` and `Stay in photomode` (both off by default).
 
 ## Photomode follow-camera link
 
@@ -66,7 +93,10 @@ typed `/overlay stats <name>` is a pinned lookup the camera won't override. Togg
 behaviour with the **Cam sync** button (or `/overlay cam on|off`); the state is persisted.
 
 It only ever reads/writes the caster's own spectator camera (no network, no effect on anyone
-else) and never force-enables photomode.
+else). Leaving photomode always clears the overlay. The optional **Stay in photomode** setting
+(off by default) can auto-enter your own photomode at round start, but only when the server
+already permits it (it checks the game's own `CanEnablePhotoMode`), so it respects the lobby's
+photomode rules and never forces it on a racer.
 
 ## Compare cam (optional, needs the PhotoDrone mod)
 
@@ -127,13 +157,20 @@ buttons, **left-click goes forward and right-click goes back** (to undo an overs
   round, yellow = alive but in the last *elim/round* places (the bubble), white = the rest, in
   leaderboard order. Eliminated players and spectators are dropped. Driven by COTDTracker's log
   events + the live leaderboard.
-- **Topout** (agix's TopOutTournament): finalists shown yellow, everyone else white, winners
-  sent to the bottom, all ordered by championship points (highest first). Nuisances (eliminated
-  but still on track as blockers) sit red at the very bottom while the cup is live — still worth
-  a glance — then drop once the cup is decided (a winner exists, or 3 finalists are set). Reads
-  the game's native custom-leaderboard data the host pushes (`GetLeaderboardOverride` text +
+- **Topout** (agix's TopOutTournament): ordered for click-to-follow casting, top to bottom.
+  Nuisances (eliminated players still racing as blockers, e.g. Maki) are pinned red on top while
+  the race is on, then drop once the finals take shape (a winner exists, or 2 finalists are
+  locked). Finalists are yellow; everyone else is white by championship points (highest first);
+  winners are green at the bottom, always kept so you can still follow their runs. Reads the
+  game's native custom-leaderboard data the host pushes (`GetLeaderboardOverride` text +
   replicated `ChampionshipPoints`), so it works for a non-host caster without the results file.
-- **Pursuit**: placeholder (uses the Cup/leaderboard ordering) until its own format is built.
+- **Pursuit** (PursuitZK / Tag You're Out): alive non-spectators only (eliminated dropped),
+  ordered by the live round leaderboard fastest-first. Each player has a pursuer (who hunts them)
+  and a target (who they hunt); they lose a life when their pursuer beats their time. Coloring:
+  **orange** on the last life (L:1), else **yellow** when in danger (their pursuer has already
+  beaten their time this round), else white. Reads PursuitZK's replicated per-player state
+  (`PursuitTracker.pursuitParticipants`: lives + pursuer/target Steam IDs), so it works for a
+  non-host caster. Falls back to the Cup/leaderboard ordering when no Pursuit tournament is running.
 
 Regenerate the pool with:
 ```
