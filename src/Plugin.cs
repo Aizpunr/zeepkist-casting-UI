@@ -16,6 +16,7 @@ using ZeepSDK.Controls;
 using ZeepSDK.Multiplayer;
 using ZeepSDK.PhotoMode;
 using ZeepSDK.Racing;
+using ZeepSDK.Storage;
 using ZeepkistClient;
 
 namespace LobbyOverlay
@@ -66,6 +67,7 @@ namespace LobbyOverlay
 
         // ---- Click-to-cast control panel ----
         private bool showPanel;
+        private IModStorage storage; // ZeepSDK mod-scoped JSON storage (layout persistence)
         private bool timesIntent;             // single-select shows Times instead of Stats
         private readonly List<Sel> selected = new List<Sel>();
         private Vector2 panelScroll;
@@ -252,6 +254,7 @@ namespace LobbyOverlay
         private void Awake()
         {
             Instance = this;
+            storage = StorageApi.CreateModStorage(this); // mod-scoped JSON store (must exist before LoadLayout)
             cfgDisableMouseLook = Config.Bind("General", "Disable mouse look in photomode", false,
                 "Freezes photomode mouse-look (sets the mouse sensitivity to 0) while the overlay " +
                 "control panel is open, so you can click without swinging the camera. Controller look " +
@@ -1871,24 +1874,47 @@ namespace LobbyOverlay
             }
         }
 
+        // Persisted overlay layout (window positions + a few sticky panel choices). Property defaults
+        // (set in the ctor) match the in-code defaults, so a missing/partial file falls back cleanly.
+        // Auto-properties (not fields) so Newtonsoft serializes them reliably; ctor defaults because
+        // C# 5 has no auto-property initializers.
+        private class LayoutData
+        {
+            public float cardX { get; set; }
+            public float cardY { get; set; }
+            public float panelX { get; set; }
+            public float panelY { get; set; }
+            public float barX { get; set; }
+            public float barY { get; set; }
+            public string comp { get; set; }
+            public bool cam { get; set; }
+            public string castmode { get; set; }
+            public LayoutData()
+            {
+                cardX = 24f; cardY = 130f;
+                panelX = -1f; panelY = 130f;
+                barX = -1f; barY = 0f;
+                comp = "cotd"; cam = true; castmode = "cup";
+            }
+        }
+
+        // Load via ZeepSDK's mod storage (BrokenTracks model): JsonFileExists -> LoadFromJson(name,
+        // type), else a fresh default. Replaces the old hand-rolled BepInEx/config file.
         private void LoadLayout()
         {
             try
             {
-                string path = Path.Combine(Paths.ConfigPath, "lobbyoverlay_layout.json");
-                if (!File.Exists(path)) return;
-                JObject o = JObject.Parse(File.ReadAllText(path));
-                cardRect.x = (float)o["cardX"]; cardRect.y = (float)o["cardY"];
-                panelRect.x = (float)o["panelX"]; panelRect.y = (float)o["panelY"];
-                if (o["barX"] != null) barRect.x = (float)o["barX"];
-                if (o["barY"] != null) barRect.y = (float)o["barY"];
-                if (o["comp"] != null) selectedComp = (string)o["comp"];
-                if (o["cam"] != null) camLink = (bool)o["cam"];
-                if (o["castmode"] != null)
-                {
-                    string cm = ((string)o["castmode"]).ToLowerInvariant();
-                    castMode = cm == "topout" ? CastMode.Topout : (cm == "pursuit" ? CastMode.Pursuit : CastMode.Cup);
-                }
+                LayoutData d = (storage != null && storage.JsonFileExists("layout"))
+                    ? storage.LoadFromJson("layout", typeof(LayoutData)) as LayoutData
+                    : new LayoutData();
+                if (d == null) d = new LayoutData();
+                cardRect.x = d.cardX; cardRect.y = d.cardY;
+                panelRect.x = d.panelX; panelRect.y = d.panelY;
+                barRect.x = d.barX; barRect.y = d.barY;
+                if (!string.IsNullOrEmpty(d.comp)) selectedComp = d.comp;
+                camLink = d.cam;
+                string cm = (d.castmode ?? "cup").ToLowerInvariant();
+                castMode = cm == "topout" ? CastMode.Topout : (cm == "pursuit" ? CastMode.Pursuit : CastMode.Cup);
                 if (!availableComps.Contains(selectedComp)) selectedComp = "cotd";
             }
             catch { }
@@ -1898,12 +1924,13 @@ namespace LobbyOverlay
         {
             try
             {
-                JObject o = new JObject();
-                o["cardX"] = cardRect.x; o["cardY"] = cardRect.y;
-                o["panelX"] = panelRect.x; o["panelY"] = panelRect.y;
-                o["barX"] = barRect.x; o["barY"] = barRect.y;
-                o["comp"] = selectedComp; o["cam"] = camLink; o["castmode"] = CastLabel(castMode).ToLowerInvariant();
-                File.WriteAllText(Path.Combine(Paths.ConfigPath, "lobbyoverlay_layout.json"), o.ToString());
+                if (storage == null) return;
+                LayoutData d = new LayoutData();
+                d.cardX = cardRect.x; d.cardY = cardRect.y;
+                d.panelX = panelRect.x; d.panelY = panelRect.y;
+                d.barX = barRect.x; d.barY = barRect.y;
+                d.comp = selectedComp; d.cam = camLink; d.castmode = CastLabel(castMode).ToLowerInvariant();
+                storage.SaveToJson("layout", d);
             }
             catch { }
         }
