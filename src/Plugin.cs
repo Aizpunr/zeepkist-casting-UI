@@ -67,7 +67,7 @@ namespace LobbyOverlay
 
         // ---- Click-to-cast control panel ----
         private bool showPanel;
-        private IModStorage storage; // ZeepSDK mod-scoped JSON storage (layout persistence)
+        public IModStorage Storage { get; private set; } // ZeepSDK mod-scoped JSON store (Plugin.Instance.Storage)
         private bool timesIntent;             // single-select shows Times instead of Stats
         private readonly List<Sel> selected = new List<Sel>();
         private Vector2 panelScroll;
@@ -254,7 +254,7 @@ namespace LobbyOverlay
         private void Awake()
         {
             Instance = this;
-            storage = StorageApi.CreateModStorage(this); // mod-scoped JSON store (must exist before LoadLayout)
+            Storage = StorageApi.CreateModStorage(this); // mod-scoped JSON store (must exist before LoadLayout)
             cfgDisableMouseLook = Config.Bind("General", "Disable mouse look in photomode", false,
                 "Freezes photomode mouse-look (sets the mouse sensitivity to 0) while the overlay " +
                 "control panel is open, so you can click without swinging the camera. Controller look " +
@@ -1898,39 +1898,54 @@ namespace LobbyOverlay
             }
         }
 
-        // Load via ZeepSDK's mod storage (BrokenTracks model): JsonFileExists -> LoadFromJson(name,
-        // type), else a fresh default. Replaces the old hand-rolled BepInEx/config file.
+        private const string LayoutFile = "layout";
+
+        // Load via ZeepSDK mod storage, matching the BrokenTracks / HNZConfig model: if the file
+        // exists, load + apply it; otherwise apply defaults and write them so the file exists right
+        // away. Replaces the old hand-rolled BepInEx/config file.
         private void LoadLayout()
         {
             try
             {
-                LayoutData d = (storage != null && storage.JsonFileExists("layout"))
-                    ? storage.LoadFromJson("layout", typeof(LayoutData)) as LayoutData
-                    : new LayoutData();
-                if (d == null) d = new LayoutData();
-                cardRect.x = d.cardX; cardRect.y = d.cardY;
-                panelRect.x = d.panelX; panelRect.y = d.panelY;
-                barRect.x = d.barX; barRect.y = d.barY;
-                if (!string.IsNullOrEmpty(d.comp)) selectedComp = d.comp;
-                camLink = d.cam;
-                string cm = (d.castmode ?? "cup").ToLowerInvariant();
-                castMode = cm == "topout" ? CastMode.Topout : (cm == "pursuit" ? CastMode.Pursuit : CastMode.Cup);
-                if (!availableComps.Contains(selectedComp)) selectedComp = "cotd";
+                if (Storage != null && Storage.JsonFileExists(LayoutFile))
+                {
+                    ApplyLayout(Storage.LoadFromJson(LayoutFile, typeof(LayoutData)) as LayoutData);
+                }
+                else
+                {
+                    ApplyLayout(new LayoutData()); // defaults
+                    SaveLayout();                  // materialize the file on first run
+                }
             }
             catch { }
+        }
+
+        // Copy a loaded LayoutData onto the live overlay state (positions are Unity Rects, hence the
+        // map rather than holding the POCO as the live object).
+        private void ApplyLayout(LayoutData d)
+        {
+            if (d == null) d = new LayoutData();
+            cardRect.x = d.cardX; cardRect.y = d.cardY;
+            panelRect.x = d.panelX; panelRect.y = d.panelY;
+            barRect.x = d.barX; barRect.y = d.barY;
+            if (!string.IsNullOrEmpty(d.comp)) selectedComp = d.comp;
+            camLink = d.cam;
+            string cm = (d.castmode ?? "cup").ToLowerInvariant();
+            castMode = cm == "topout" ? CastMode.Topout : (cm == "pursuit" ? CastMode.Pursuit : CastMode.Cup);
+            if (!availableComps.Contains(selectedComp)) selectedComp = "cotd";
         }
 
         private void SaveLayout()
         {
             try
             {
-                if (storage == null) return;
+                if (Storage == null) return;
                 LayoutData d = new LayoutData();
                 d.cardX = cardRect.x; d.cardY = cardRect.y;
                 d.panelX = panelRect.x; d.panelY = panelRect.y;
                 d.barX = barRect.x; d.barY = barRect.y;
                 d.comp = selectedComp; d.cam = camLink; d.castmode = CastLabel(castMode).ToLowerInvariant();
-                storage.SaveToJson("layout", d);
+                Storage.SaveToJson(LayoutFile, d);
             }
             catch { }
         }
