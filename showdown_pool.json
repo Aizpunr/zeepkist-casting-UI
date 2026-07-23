@@ -1,0 +1,86 @@
+{
+  "season": 7,
+  "updated": "2026-07-22",
+
+  "qualifier": {
+    "name": "Casual Showdown Cualifier",
+    "hash": "1A7E7E577BF56EAF6370C107233EE81FD019D548-3",
+    "workshop_id": "3761954008"
+  },
+
+  "maps": [
+    { "n": 1, "name": "Sticky Slidey",   "authors": "Tommygaming & Mokster",                 "hash": "30A1C918494DD3723964CE9FF56D3EF09383744F-3", "workshop_id": "3761956070" },
+    { "n": 2, "name": "CatFindTheSpace", "authors": "CantFindTheSky & space_cat",            "hash": "6DC042A17FE06D00895A1D85B1B7FEB0A238BD57-3", "workshop_id": "3761965046" },
+    { "n": 3, "name": "Love City",       "authors": "ShyGirlyRaccoon & DeeDeeNaNaNa",        "hash": "0363216F4A2396F6CC753BBAA212F4A73A82E63D-3", "workshop_id": "3761965963" },
+    { "n": 4, "name": "Seasons",         "authors": "Murrl & An Actual G00se",               "hash": "0F2F31802076D5CFBF2B294EADB442E7DB9F11D1-3", "workshop_id": "3761966278" },
+    { "n": 5, "name": "Celestial Coast", "authors": "Sahne mit Bohnen & redal",              "hash": "6F319EE1DA960BB6791C63069217D56F4B2B0FD0-3", "workshop_id": "3761966713" },
+    { "n": 6, "name": "Glacial Tundra",  "authors": "IronDragon & OccasionallyAmazingGamer", "hash": "0A8348379726E1A148B6AF569386715E844E6DC2-3", "workshop_id": "3761967320" },
+    { "n": 7, "name": "Gotta Go Slow",   "authors": "OgelGames & variableferret",            "hash": "D94D98C74930DBB21846F9E24FCF13FAD2BC15A0-3", "workshop_id": "3761968001" }
+  ],
+
+  "teams": [
+    {
+      "tag": "T7",
+      "name": "Team 7, the 8th Team",
+      "color": "#e2012d",
+      "players": [
+        { "name": "Lexer",     "steam_id": "76561198851912263", "aliases": [] },
+        { "name": "Heart-TGV", "steam_id": "76561198364662649", "aliases": [] }
+      ]
+    },
+    {
+      "tag": "KBW",
+      "name": "Keyboard Warriors",
+      "color": "#91204d",
+      "players": [
+        { "name": "Kernkob",   "steam_id": "76561199024808939", "aliases": [] },
+        { "name": "microways", "steam_id": "76561199448462477", "aliases": [] }
+      ]
+    },
+    {
+      "tag": "EG",
+      "name": "El Gato",
+      "color": "#008F3E",
+      "players": [
+        { "name": "justMaki", "steam_id": "76561198050792757", "aliases": ["justMak"] },
+        { "name": "Victor",   "steam_id": "76561199380118922", "aliases": [] }
+      ]
+    },
+    {
+      "tag": "AgOH",
+      "name": "Silver Hydroxide",
+      "color": "#ffefad",
+      "players": [
+        { "name": "Hydro", "steam_id": "76561199027567424", "aliases": ["K2 Blue"] },
+        { "name": "agix",  "steam_id": "76561198974231691", "aliases": ["Agix"] }
+      ]
+    },
+    {
+      "tag": "SOS",
+      "name": "Slide-Out Savants",
+      "color": "#fda900",
+      "players": [
+        { "name": "Jake",      "steam_id": "76561198152852852", "aliases": ["JakeAdjacent"] },
+        { "name": "PandaMane", "steam_id": "76561198253679880", "aliases": [] }
+      ]
+    },
+    {
+      "tag": "STBN",
+      "name": "Sterben",
+      "color": "#568B30",
+      "players": [
+        { "name": "Quickracer10", "steam_id": "76561198149636594", "aliases": [] },
+        { "name": "B_ES",         "steam_id": "76561199082360966", "aliases": [] }
+      ]
+    },
+    {
+      "tag": "ZMPS",
+      "name": "Panthers",
+      "color": "#000000",
+      "players": [
+        { "name": "ZOMAN", "steam_id": "76561199126724675", "aliases": ["Zoman"] },
+        { "name": "Pants", "steam_id": "76561199498272376", "aliases": [] }
+      ]
+    }
+  ]
+}

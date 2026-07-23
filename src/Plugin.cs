@@ -13,6 +13,7 @@ using UnityEngine;
 using ZeepSDK.Chat;
 using ZeepSDK.ChatCommands;
 using ZeepSDK.Controls;
+using ZeepSDK.Level;
 using ZeepSDK.Multiplayer;
 using ZeepSDK.PhotoMode;
 using ZeepSDK.Racing;
@@ -48,6 +49,22 @@ namespace LobbyOverlay
             "https://raw.githubusercontent.com/Aizpunr/zeepkist-casting-UI/main/overlay_pool.json";
         private volatile string pendingPoolJson; // fetched JSON awaiting main-thread apply
 
+        // ---- Showdown: teams + season map pool (hand-authored, separate from overlay_pool.json so a
+        // pool rebuild can never clobber it). Same load pattern: local file first, repo fetch on top.
+        private const string SD_URL =
+            "https://raw.githubusercontent.com/Aizpunr/zeepkist-casting-UI/main/showdown_pool.json";
+        private volatile string pendingSdJson;
+
+        // ---- GTR world record for the current map (graphql.zeepki.st, fetched on a bg thread) ----
+        private string wrUid;                    // level UID the cached/in-flight WR is for (main-thread cache key)
+        private string wrHolder = "";            // WR holder name ("" = none/failed)
+        private string wrTime = "";              // WR time, "M:SS.mmm" ("" = none/failed)
+        private bool wrFetching;                 // a fetch is in flight (main-thread flag; blocks re-fire)
+        private volatile bool wrPending;         // bg thread finished; main thread should commit the result
+        private volatile string wrPendingUid;
+        private volatile string wrPendingHolder;
+        private volatile string wrPendingTime;
+
         // ---- Live cup state (ported from casting-tool/parser.py CupState) ----
         private int liveRound;
         private bool pendingRound;
@@ -56,6 +73,13 @@ namespace LobbyOverlay
         private readonly HashSet<string> eliminatedLive = new HashSet<string>(); // out of the cup
         private readonly Dictionary<string, List<RoundTime>> playerRoundTimes =
             new Dictionary<string, List<RoundTime>>();
+
+        // ---- Multi-map cup support (Petite = 2 maps, Kerki = 3, alternating between rounds) ----
+        // Each stored RoundTime is tagged with the level UID it was raced on, so the "Best" line and
+        // the Times view can scope to the map currently up instead of blending both maps together.
+        private string curRoundMapUid;                                    // map of the round accumulating now (null until first time seen)
+        private readonly Dictionary<string, string> mapNames = new Dictionary<string, string>(); // uid -> human-readable map name
+        private readonly List<string> mapOrder = new List<string>();      // uids in first-seen order (grouping order)
 
         // ---- Layout (drag-to-move while panel is open; persists to disk) ----
         private Rect cardRect = new Rect(24f, 130f, 320f, 290f);
@@ -67,21 +91,32 @@ namespace LobbyOverlay
 
         // ---- Click-to-cast control panel ----
         private bool showPanel;
+        private bool stayPanelWanted;        // was the panel up when photomode auto-exited? (reopen it on stay-in-photomode re-entry)
         public IModStorage Storage { get; private set; } // ZeepSDK mod-scoped JSON store (Plugin.Instance.Storage)
         private bool timesIntent;             // single-select shows Times instead of Stats
         private readonly List<Sel> selected = new List<Sel>();
         private Vector2 panelScroll;
+        // Panel rows are rebuilt on the 5 Hz Update poll, never in OnGUI. Unity fires OnGUI several
+        // times per frame (Layout + Repaint + one per input event; moving the mouse produces one every
+        // frame), and BuildPanelRows does a reflection call per player plus a fresh list+row allocation
+        // each pass - which is what made the overlay eat frames on strong machines.
+        private List<PRow> panelRowsCache;
+        private string barBestLine;           // mode-bar cup-best line, refreshed on the same poll
+        private string barWrLine;             // mode-bar world-record line
         private CursorLockMode prevLock;
         private bool prevCursorVisible;
         private bool cursorSaved;
         private float savedMouseSens = -1f;  // photomode MOUSE look sensitivity, zeroed while frozen
+        private float savedCtrlSens = -1f;   // photomode CONTROLLER look sensitivity, zeroed only on mouse-move frames
         private bool mouseFreezeWarned;      // logged the "can't reach settings" warning once
 
         // ---- Config (BepInEx; persists to BepInEx/config/com.aizpun.lobbyoverlay.cfg) ----
         // Both default OFF. Mouse-look freeze is opt-in (it can fight the free-cam); stay-in-photomode
         // only makes sense for a dedicated caster, never on for a racer.
-        private ConfigEntry<bool> cfgDisableMouseLook; // freeze mouse-look while the panel is open
+        private ConfigEntry<bool> cfgEnabled;          // master on/off; OFF by default and re-armed OFF each launch (never remembered)
+        private bool enabledApplied;                   // last-reconciled enabled state (edge-detect for the on/off teardown)
         private ConfigEntry<bool> cfgStayInPhotomode;  // auto re-enter photomode each round (server-gated)
+        private ConfigEntry<bool> cfgFreezeMouse;      // freeze MOUSE look while the panel is open (default ON)
         private ConfigEntry<KeyCode> cfgKeyPanel;      // toggle the control panel (default F4)
         private ConfigEntry<KeyCode> cfgKeyClear;      // clear everything (default F5)
         private ConfigEntry<FollowCam> cfgFollowCamState; // photomode camera mode forced on left-click follow (None = leave alone)
@@ -105,6 +140,12 @@ namespace LobbyOverlay
         private string clearHoldSid;         // sid held at Clear time ("" = was following nobody)
         private bool inPhotoMode;            // event-driven (PhotoModeApi enter/exit); gates the cam/drone poll
         private bool holdArmPending;         // photomode just opened: hold its auto-picked target
+        // Camera-mode memory: carry the caster's photomode camera (e.g. the trailcam/dynamic follow)
+        // across rounds. Captured ONCE when leaving photomode (your last camera choice), then re-applied
+        // once on the next entry - no per-frame recording, so it costs nothing while you're casting.
+        private int lastCamState = -1;       // camera mode captured on the last photomode exit (-1 = none yet)
+        private bool lastCamAlt;             // its alternateCameraState flag
+        private bool camRestorePending;      // re-apply the remembered mode on this photomode entry (one-shot)
 
         // ---- PhotoDrone bridge (optional Metalted mod; reflection so it stays a soft dep) ----
         // One picture-in-picture window following the H2H compare partner. PhotoDrone destroys
@@ -133,6 +174,7 @@ namespace LobbyOverlay
         private MethodInfo pdPresetSetX, pdPresetSetY, pdPresetSetW, pdPresetSetH;
         private MethodInfo pdApplyPresetMI;  // PhotoDrone.ApplyPreset(DronePreset) - moves/sizes window
         private Rect droneAppliedRect;       // last window rect we applied (change-detect)
+        private float droneScale = 1f;       // VS cam size vs the card (drag its corner; persisted). <1 = smaller/faster at 4K
         private object droneRef;             // drone instance we styled last (new ref = restyle)
         private readonly HashSet<string> droneLogged = new HashSet<string>(); // once-only log lines
 
@@ -159,7 +201,9 @@ namespace LobbyOverlay
         {
             public int Round;
             public string Time;
-            public RoundTime(int round, string time) { Round = round; Time = time; }
+            public string Uid;   // level UID this time was raced on (null = untagged/legacy)
+            public RoundTime(int round, string time) : this(round, time, null) { }
+            public RoundTime(int round, string time, string uid) { Round = round; Time = time; Uid = uid; }
         }
 
         // Lazily-built IMGUI styles (GUI.skin is only valid inside OnGUI).
@@ -167,6 +211,11 @@ namespace LobbyOverlay
         private GUIStyle boxStyle;
         private GUIStyle headerStyle;
         private GUIStyle labelStyle;
+        private GUIStyle bestStyle;   // white "Best time:" line under the mode-bar buttons
+        private GUIStyle sdTagStyle;  // Showdown team tag (big, tinted by team colour)
+        private GUIStyle sdScoreStyle;// Showdown "1 - 0" between the tags
+        private GUIStyle sdSubStyle;  // Showdown round/map line under the tags
+        private GUIStyle sdNameStyle; // Showdown racer-name column
         private GUIStyle valueStyle;
         private GUIStyle nameLeftStyle;
         private GUIStyle nameRightStyle;
@@ -214,6 +263,79 @@ namespace LobbyOverlay
             public Dictionary<string, CompStat> Comps = new Dictionary<string, CompStat>();
         }
 
+        // ---- Showdown / generic two-team match ----------------------------------------------------
+        // Deliberately format-agnostic: two teams of N, round scored on the team AVERAGE time, first to
+        // `sdTarget` points. Showdown just configures it (2v2, first to 2), so ranked can reuse it.
+        private class SdPlayer
+        {
+            public string Name;
+            public string SteamId;
+            public string[] Aliases;
+        }
+
+        private class SdTeam
+        {
+            public string Tag;      // short broadcast tag; team names can run 200+ chars
+            public string Name;
+            public Color Col;       // team colour from the JSON
+            public bool HasCol;
+            public List<SdPlayer> Players = new List<SdPlayer>();
+        }
+
+        private class SdMap
+        {
+            public int N;           // season map number (#1..#7)
+            public string Name;
+            public string Authors;
+            public string Hash;     // GTR hash, uppercase, may carry a "-N" version suffix
+        }
+
+        private readonly List<SdTeam> sdTeams = new List<SdTeam>();
+        private readonly List<SdMap> sdMaps = new List<SdMap>();
+        private readonly Dictionary<string, SdTeam> sdBySid = new Dictionary<string, SdTeam>();
+        private string sdSeason = "?";
+
+        // Live match state
+        private SdTeam sdA, sdB;             // resolved matchup (null until two teams are present)
+        private int sdPtsA, sdPtsB;
+        private int sdTarget = 2;            // first to this many round wins
+        private string sdPickerTag;          // which team picked the map currently up (null = unknown)
+        private bool sdPickerRandom;         // map was randomised by the draft (no picker)
+        private string sdLastMapHash;        // change-detect so the picker label clears on a new map
+        private bool sdQuadOn;               // "show all": one PhotoDrone per racer, 2x2
+        private readonly List<QuadSlot> quadSlots = new List<QuadSlot>();
+        private bool quadMade;               // we have created >=1 quad drone (so teardown must keep running)
+        private bool vsDroneMade;            // ...same for the single VS cam
+        private SdTeam sdOvA, sdOvB;         // teams mirrored from the Showdown mod's leaderboard colours
+        private string sdOvSig;              // colour+roster signature the mirror was built from
+        private bool sdOvNewMatch = true;    // first mirror of a session counts as a new match
+        private bool sdDebugTeams;           // split the live lobby into two fake teams (testing)
+        private SdTeam sdDbgA, sdDbgB;
+        private string sdDbgSig;             // roster the debug split was built from
+        private Rect sdRect = new Rect(-1f, 0f, 0f, 0f); // Showdown score box; own box, x<0 = default pos
+        private bool sdMatchupForced;        // caster pinned the matchup; stop auto-detecting
+        private string sdRosterSig;          // lobby steam-id signature the matchup was resolved from
+        private readonly HashSet<string> sdScored = new HashSet<string>(); // map hashes already scored
+        private readonly Dictionary<string, SdTeam> sdMoved =             // manual per-player overrides
+            new Dictionary<string, SdTeam>();
+
+        // Computed on the Update poll, rendered verbatim by OnGUI (never computed in the render path).
+        private float sdAvgA = -1f, sdAvgB = -1f;         // live team average OF FINISHERS (-1 = none yet)
+        private float sdProjA = -1f, sdProjB = -1f;       // same, from GTR PBs on the current map
+        private int sdFinA, sdFinB;                        // finisher counts (the first tiebreak)
+        private int sdLead;                                // -1 A leads, +1 B leads, 0 undecided
+        private string sdLeadMethod;                       // which rule decided it, for the caster
+        private float sdLeadGap = -1f;
+        private SdMap sdCurMap;                            // season map currently loaded (null = off-pool)
+
+        // ---- Per-racer GTR personal bests on the current map (one query for the whole lobby) ----
+        private readonly Dictionary<string, float> sdPb = new Dictionary<string, float>(); // sid -> seconds
+        private string sdPbKey;                   // "<hash>|<sid,sid,...>" the cache/in-flight fetch is for
+        private bool sdPbFetching;
+        private volatile bool sdPbPending;        // bg thread finished; main thread should commit
+        private volatile string sdPbPendingKey;
+        private volatile Dictionary<string, float> sdPbPendingMap;
+
         // [Stats] button: which comp pool feeds wins/best/podiums/cups AND the H2H mutual record.
         private string selectedComp = "cotd";
         private readonly List<string> availableComps = new List<string>();
@@ -226,13 +348,14 @@ namespace LobbyOverlay
         private enum FollowCam { None = -1, State0 = 0, State1 = 1, State2 = 2, State3 = 3, State4 = 4, State5 = 5, DynamicFollow = 6, State7 = 7 }
 
         // [Comp] button: which cup FORMAT drives the player-list ordering logic (not the stats).
-        private enum CastMode { Cup, Topout, Pursuit }
+        private enum CastMode { Cup, Topout, Pursuit, Showdown }
         private CastMode castMode = CastMode.Cup;
-        private static readonly CastMode[] CAST_ORDER = { CastMode.Cup, CastMode.Topout, CastMode.Pursuit };
+        private static readonly CastMode[] CAST_ORDER = { CastMode.Cup, CastMode.Topout, CastMode.Pursuit, CastMode.Showdown };
         private static string CastLabel(CastMode m)
         {
             if (m == CastMode.Topout) return "Topout";
             if (m == CastMode.Pursuit) return "Pursuit";
+            if (m == CastMode.Showdown) return "Showdown";
             return "Cup";
         }
         private static string CompLabel(string c)
@@ -255,14 +378,24 @@ namespace LobbyOverlay
         {
             Instance = this;
             Storage = StorageApi.CreateModStorage(this); // mod-scoped JSON store (must exist before LoadLayout)
-            cfgDisableMouseLook = Config.Bind("General", "Disable mouse look in photomode", false,
-                "Freezes photomode mouse-look (sets the mouse sensitivity to 0) while the overlay " +
-                "control panel is open, so you can click without swinging the camera. Controller look " +
-                "is unaffected. Off by default.");
+            cfgEnabled = Config.Bind("General", "Enabled", false,
+                "Master switch for the whole overlay. OFF by default and re-armed to OFF every launch, " +
+                "so the mod stays completely dormant (no cards, no camera tracking) until you turn it " +
+                "on. F4 is the master on/off toggle: press it in a lobby to enable + open the panel, " +
+                "press it again to turn the whole mod off. (You can also tick this or run any /overlay " +
+                "command to enable.) Cycling players in photomode never enables it - only F4 (or those). " +
+                "Deliberately not remembered between sessions, so it only ever runs when you want it to.");
+            cfgEnabled.Value = false; // never remember: always start disabled regardless of the saved value
             cfgStayInPhotomode = Config.Bind("General", "Stay in photomode", false,
                 "Auto re-enters photomode at the start of each round (for casters/spectators). Respects " +
                 "the server's photomode rules and never forces it when a comp disables or gates " +
                 "photomode. Off by default.");
+            cfgFreezeMouse = Config.Bind("General", "Freeze mouse-look while panel open", true,
+                "While the control panel is open, freezes the photomode MOUSE camera look so you can " +
+                "move the mouse to click the overlay buttons without spinning the free-cam. The " +
+                "controller keeps flying (it has its own look sensitivity), so following the pack with a " +
+                "pad is unaffected. On by default - the casting default. Turn it OFF only if you fly the " +
+                "free-cam with the mouse itself and accept that clicking will move the camera.");
             cfgKeyPanel = Config.Bind("Hotkeys", "Toggle panel", KeyCode.F4,
                 "Key to open/close the click-to-cast control panel.");
             cfgKeyClear = Config.Bind("Hotkeys", "Clear overlay", KeyCode.F5,
@@ -274,6 +407,7 @@ namespace LobbyOverlay
                 "in-game camera keybinds still work to change it on the fly; this only sets the default " +
                 "applied on a click.");
             LoadPool();
+            LoadSdPool();
             BuildAvailableComps();
             LoadLayout();
             ChatCommandApi.RegisterLocalChatCommand("/", "overlay",
@@ -310,10 +444,9 @@ namespace LobbyOverlay
                 if (efc0 != null && efc0.isPhotoMode) inPhotoMode = true;
             }
             catch (Exception ex) { Logger.LogError("Photomode/racing hooks failed: " + ex); }
-            Logger.LogInfo(string.Format("Tournament Casting UI 1.0.0-beta.3 loaded. Local pool v{0}, {1} players (refreshing from repo).",
+            Logger.LogInfo(string.Format("Tournament Casting UI 1.0.0-beta.8 loaded. Local pool v{0}, {1} players (refreshing from repo).",
                 poolVersion, pool.Count));
-            Logger.LogInfo(string.Format("[config] Disable mouse look in photomode = {0}; Stay in photomode = {1}",
-                cfgDisableMouseLook.Value, cfgStayInPhotomode.Value));
+            Logger.LogInfo(string.Format("[config] Stay in photomode = {0}", cfgStayInPhotomode.Value));
         }
 
         // Load the local file immediately (offline/dev), then refresh from the repo (async).
@@ -419,10 +552,716 @@ namespace LobbyOverlay
             try { return (float)t; } catch { return 0f; }
         }
 
+        // ---- Showdown pool: same two-stage load as the stats pool (local file, then repo on top) ----
+
+        private void LoadSdPool()
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+                string path = Path.Combine(dir, "showdown_pool.json");
+                if (File.Exists(path)) ApplySdPool(File.ReadAllText(path), "local");
+            }
+            catch (Exception ex) { Logger.LogError("LoadSdPool (local) failed: " + ex); }
+            try
+            {
+                WebClient client = new WebClient();
+                client.DownloadStringCompleted += delegate (object sender, DownloadStringCompletedEventArgs e)
+                {
+                    if (e.Error != null) { Logger.LogWarning("[sd] pool fetch failed (using local): " + e.Error.Message); return; }
+                    pendingSdJson = e.Result;
+                };
+                client.DownloadStringAsync(new Uri(SD_URL));
+            }
+            catch (Exception ex) { Logger.LogWarning("[sd] pool fetch could not start (using local): " + ex.Message); }
+        }
+
+        // Replace the teams/maps tables from a JSON document. Rejects an empty/garbage payload so a bad
+        // fetch can never wipe a good local file mid-event.
+        private void ApplySdPool(string json, string source)
+        {
+            try
+            {
+                JObject root = JObject.Parse(json);
+                List<SdMap> maps = new List<SdMap>();
+                JArray ma = root["maps"] as JArray;
+                if (ma != null)
+                {
+                    foreach (JToken t in ma)
+                    {
+                        JObject o = t as JObject;
+                        if (o == null) continue;
+                        SdMap m = new SdMap();
+                        m.N = (int)JNum(o, "n");
+                        m.Name = (string)o["name"];
+                        m.Authors = (string)o["authors"];
+                        string h = (string)o["hash"];
+                        m.Hash = string.IsNullOrEmpty(h) ? null : h.ToUpperInvariant();
+                        if (m.Hash != null) maps.Add(m);
+                    }
+                }
+                List<SdTeam> teams = new List<SdTeam>();
+                JArray ta = root["teams"] as JArray;
+                if (ta != null)
+                {
+                    foreach (JToken t in ta)
+                    {
+                        JObject o = t as JObject;
+                        if (o == null) continue;
+                        SdTeam tm = new SdTeam();
+                        tm.Tag = (string)o["tag"];
+                        tm.Name = (string)o["name"];
+                        Color c;
+                        tm.HasCol = TryParseHexColor((string)o["color"], out c);
+                        tm.Col = tm.HasCol ? c : pnameCol;
+                        JArray pa = o["players"] as JArray;
+                        if (pa != null)
+                        {
+                            foreach (JToken pt in pa)
+                            {
+                                JObject po = pt as JObject;
+                                if (po == null) continue;
+                                SdPlayer p = new SdPlayer();
+                                p.Name = (string)po["name"];
+                                p.SteamId = (string)po["steam_id"];
+                                List<string> al = new List<string>();
+                                JArray aa = po["aliases"] as JArray;
+                                if (aa != null) foreach (JToken at in aa) { string s = (string)at; if (!string.IsNullOrEmpty(s)) al.Add(s); }
+                                p.Aliases = al.ToArray();
+                                tm.Players.Add(p);
+                            }
+                        }
+                        if (!string.IsNullOrEmpty(tm.Tag)) teams.Add(tm);
+                    }
+                }
+                if (teams.Count == 0 && maps.Count == 0) { Logger.LogWarning("[sd] " + source + " pool empty - ignored"); return; }
+
+                sdTeams.Clear(); sdTeams.AddRange(teams);
+                sdMaps.Clear(); sdMaps.AddRange(maps);
+                sdSeason = root["season"] != null ? root["season"].ToString() : "?";
+                RebuildSdIndex();
+                sdRosterSig = null; // force a matchup re-detect against the new tables
+                Logger.LogInfo(string.Format("[sd] pool loaded ({0}): season {1}, {2} teams, {3} maps",
+                    source, sdSeason, sdTeams.Count, sdMaps.Count));
+            }
+            catch (Exception ex) { Logger.LogError("[sd] ApplySdPool (" + source + ") failed: " + ex); }
+        }
+
+        // Steam id -> team lookup. Manual /overlay sd move overrides are re-applied to the ROSTERS here,
+        // not just to the index: the repo fetch replaces sdTeams wholesale, and a caster's live
+        // substitution must survive that (otherwise a fetch landing after a swap silently undoes it).
+        private void RebuildSdIndex()
+        {
+            foreach (KeyValuePair<string, SdTeam> kv in sdMoved)
+            {
+                SdTeam dest = SdTeamByTag(kv.Value.Tag); // re-resolve: kv.Value may be a stale instance
+                if (dest == null) continue;
+                string name = null;
+                foreach (SdTeam t in sdTeams)
+                    for (int i = t.Players.Count - 1; i >= 0; i--)
+                        if (t.Players[i].SteamId == kv.Key) { name = t.Players[i].Name; t.Players.RemoveAt(i); }
+                SdPlayer np = new SdPlayer();
+                np.SteamId = kv.Key;
+                np.Name = name != null ? name : (LobbyNameForSid(kv.Key) ?? kv.Key);
+                np.Aliases = new string[0];
+                dest.Players.Add(np);
+            }
+
+            sdBySid.Clear();
+            foreach (SdTeam t in sdTeams)
+                foreach (SdPlayer p in t.Players)
+                    if (!string.IsNullOrEmpty(p.SteamId)) sdBySid[p.SteamId] = t;
+            // Aliases stay a name-only fallback: the index is keyed by steam id, which is what the
+            // lobby roster gives us directly, so no alias entries are needed here.
+        }
+
+        // "#rrggbb" / "rrggbb" -> Color. Team colours come from the organisers' signup posts.
+        private static bool TryParseHexColor(string hex, out Color col)
+        {
+            col = Color.white;
+            if (string.IsNullOrEmpty(hex)) return false;
+            string h = hex.Trim();
+            if (h.StartsWith("#")) h = h.Substring(1);
+            if (h.Length != 6) return false;
+            int r, g, b;
+            if (!int.TryParse(h.Substring(0, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out r)) return false;
+            if (!int.TryParse(h.Substring(2, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out g)) return false;
+            if (!int.TryParse(h.Substring(4, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out b)) return false;
+            col = new Color(r / 255f, g / 255f, b / 255f);
+            return true;
+        }
+
+        // ---- Showdown match engine -----------------------------------------------------------------
+
+        // Work out which two teams are in the lobby. This is what makes the mode hands-off: the operator
+        // joins and the card is already right. Only recomputed when the set of steam ids changes, and
+        // never once the caster has pinned a matchup with /overlay sd <a> <b>.
+        private void SdDetectMatchup(bool force)
+        {
+            if (sdMatchupForced && !force) return;
+            // The Showdown mod is authoritative when it's running: it broadcasts each racer's team
+            // colour on the replicated leaderboard, so mirror that rather than trusting our own roster
+            // file. Debug teams and a caster-pinned matchup still win over it.
+            if (!sdDebugTeams && !sdMatchupForced && SdDetectFromOverrides()) return;
+            List<ZeepkistNetworkPlayer> list;
+            try { list = ZeepkistNetwork.PlayerList; } catch { return; }
+            if (list == null) return;
+
+            // Cheap change-detect: the sorted-ish concatenation of ids present.
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            foreach (ZeepkistNetworkPlayer p in list) { sb.Append(p.SteamID); sb.Append(','); }
+            string sig = sb.ToString();
+            if (!force && sig == sdRosterSig) return;
+            sdRosterSig = sig;
+            if (sdMatchupForced) return;
+
+            Dictionary<SdTeam, int> counts = new Dictionary<SdTeam, int>();
+            foreach (ZeepkistNetworkPlayer p in list)
+            {
+                SdTeam t;
+                if (sdBySid.TryGetValue(p.SteamID.ToString(CultureInfo.InvariantCulture), out t))
+                {
+                    int n; counts.TryGetValue(t, out n); counts[t] = n + 1;
+                }
+            }
+            SdTeam bestA = null, bestB = null;
+            int cA = 0, cB = 0;
+            foreach (KeyValuePair<SdTeam, int> kv in counts)
+            {
+                if (kv.Value > cA) { bestB = bestA; cB = cA; bestA = kv.Key; cA = kv.Value; }
+                else if (kv.Value > cB) { bestB = kv.Key; cB = kv.Value; }
+            }
+            if (bestA == null || bestB == null) return; // nothing detectable: KEEP the current matchup
+
+            // Already showing this pairing (in either order)? Nothing to do - and crucially, don't
+            // reset the score just because the detector re-ran.
+            bool same = (bestA == sdA && bestB == sdB) || (bestA == sdB && bestB == sdA);
+            if (same) return;
+
+            // Replacing an established matchup needs confidence, or one racer rage-quitting mid-match
+            // would "detect" a different pair and wipe the score. A fresh detection is permissive; an
+            // overwrite requires both candidate teams to be fully present.
+            bool established = sdA != null && sdB != null;
+            if (established && (cA < 2 || cB < 2)) return;
+
+            // Stable left/right by tag so the card doesn't swap sides between rounds.
+            if (string.Compare(bestA.Tag, bestB.Tag, StringComparison.OrdinalIgnoreCase) <= 0) { sdA = bestA; sdB = bestB; }
+            else { sdA = bestB; sdB = bestA; }
+
+            // A different pairing means a different match: points and picks from the last one are
+            // meaningless.
+            sdPtsA = 0; sdPtsB = 0; sdScored.Clear();
+            sdPickerTag = null; sdPickerRandom = false;
+            sdPbKey = null; // new roster -> refetch PBs
+            Logger.LogInfo(string.Format("[sd] matchup: {0} vs {1}", sdA.Tag, sdB.Tag));
+        }
+
+        private bool SdMatchLive() { return castMode == CastMode.Showdown && sdA != null && sdB != null; }
+
+        // Which path produced the current matchup - worth surfacing, because "mirroring the Showdown
+        // mod" and "guessing from our own roster file" are very different levels of trustworthy.
+        private string SdTeamSource()
+        {
+            if (sdDebugTeams) return "debug split";
+            if (sdMatchupForced) return "pinned by caster";
+            if (sdA != null && sdA == sdOvA) return "Showdown mod (live)";
+            return "showdown_pool.json";
+        }
+
+        // ---- Debug teams -----------------------------------------------------------------------------
+        // The real rosters can't be exercised without the real players, so this splits whoever IS in the
+        // lobby into two teams. Assignment alternates down the steam-id-sorted roster: arbitrary, but
+        // STABLE, so the split doesn't reshuffle every poll and reset the match.
+        private void SdToggleDebugTeams()
+        {
+            sdDebugTeams = !sdDebugTeams;
+            if (sdDebugTeams)
+            {
+                if (sdDbgA == null)
+                {
+                    sdDbgA = new SdTeam(); sdDbgA.Tag = "DBG1"; sdDbgA.Name = "Debug Team 1";
+                    sdDbgA.Col = new Color(0.35f, 0.65f, 1f); sdDbgA.HasCol = true;
+                    sdDbgB = new SdTeam(); sdDbgB.Tag = "DBG2"; sdDbgB.Name = "Debug Team 2";
+                    sdDbgB.Col = new Color(1f, 0.55f, 0.20f); sdDbgB.HasCol = true;
+                }
+                if (!sdTeams.Contains(sdDbgA)) sdTeams.Add(sdDbgA);
+                if (!sdTeams.Contains(sdDbgB)) sdTeams.Add(sdDbgB);
+                sdDbgSig = null;
+                SdRebuildDebugTeams();
+                sdA = sdDbgA; sdB = sdDbgB; sdMatchupForced = true;
+                sdPtsA = 0; sdPtsB = 0; sdScored.Clear(); sdPbKey = null;
+                castMode = CastMode.Showdown;
+                ChatApi.AddLocalMessage("Showdown: debug teams ON (lobby split into DBG1 / DBG2).");
+            }
+            else
+            {
+                sdTeams.Remove(sdDbgA); sdTeams.Remove(sdDbgB);
+                sdA = null; sdB = null; sdMatchupForced = false; sdRosterSig = null; sdPbKey = null;
+                RebuildSdIndex();
+                SdDetectMatchup(true);
+                ChatApi.AddLocalMessage("Showdown: debug teams OFF.");
+            }
+        }
+
+        private void SdRebuildDebugTeams()
+        {
+            if (sdDbgA == null || sdDbgB == null) return;
+            List<ZeepkistNetworkPlayer> list;
+            try { list = ZeepkistNetwork.PlayerList; } catch { return; }
+            if (list == null) return;
+
+            List<string> sids = new List<string>();
+            foreach (ZeepkistNetworkPlayer p in list) sids.Add(p.SteamID.ToString(CultureInfo.InvariantCulture));
+            sids.Sort(StringComparer.Ordinal);
+            string sig = string.Join(",", sids.ToArray());
+            if (sig == sdDbgSig) return;   // roster unchanged: leave the existing split alone
+            sdDbgSig = sig;
+
+            sdDbgA.Players.Clear(); sdDbgB.Players.Clear();
+            for (int i = 0; i < sids.Count; i++)
+            {
+                SdPlayer p = new SdPlayer();
+                p.SteamId = sids[i];
+                p.Name = LobbyNameForSid(sids[i]) ?? sids[i];
+                p.Aliases = new string[0];
+                if ((i & 1) == 0) sdDbgA.Players.Add(p); else sdDbgB.Players.Add(p);
+            }
+            RebuildSdIndex();
+            sdPbKey = null; // roster changed -> refetch PBs for the new split
+            Logger.LogInfo(string.Format("[sd] debug teams: {0} v {1}", sdDbgA.Players.Count, sdDbgB.Players.Count));
+        }
+
+        // Reassign one player to a team, live. Shared by the panel buttons and /overlay sd move.
+        private void SdMoveSid(string sid, SdTeam dest)
+        {
+            if (string.IsNullOrEmpty(sid) || dest == null) return;
+            string name = LobbyNameForSid(sid);
+            foreach (SdTeam ot in sdTeams)
+                for (int i = ot.Players.Count - 1; i >= 0; i--)
+                    if (ot.Players[i].SteamId == sid)
+                    {
+                        if (string.IsNullOrEmpty(name)) name = ot.Players[i].Name;
+                        ot.Players.RemoveAt(i);
+                    }
+            SdPlayer np = new SdPlayer();
+            np.SteamId = sid; np.Name = string.IsNullOrEmpty(name) ? sid : name; np.Aliases = new string[0];
+            dest.Players.Add(np);
+            sdMoved[sid] = dest;
+            RebuildSdIndex();
+            sdPbKey = null;      // roster changed -> refetch PBs
+            ChatApi.AddLocalMessage("Showdown: " + np.Name + " -> " + dest.Tag);
+        }
+
+        // ---- Team detection from the Showdown mod's own leaderboard overrides ------------------------
+        // Showdown4's State_Racing pushes each racer's TEAM COLOUR into the replicated custom-leaderboard
+        // name override:  <nobr><#RRGGBB>Name</color></nobr>.  Reading that makes the Showdown mod
+        // authoritative for team membership, which beats any roster file we maintain: it survives late
+        // substitutes, an unregistered 8th team, and any drift between their JSON and ours.
+        //
+        // The colour must come from the field containing the player's NAME. Showdown4 also writes
+        // "<#00ff00>" into the TIME override for every finisher, so a blind scan would put the whole
+        // lobby on one green team.
+        private string SdOverrideTeamColor(ulong sid, string lobbyName)
+        {
+            if (toOverrideStrFIs == null || toGetOverrideMI == null || string.IsNullOrEmpty(lobbyName)) return null;
+            try
+            {
+                object ov = toGetOverrideMI.Invoke(null, new object[] { sid });
+                if (ov == null) return null;
+                for (int i = 0; i < toOverrideStrFIs.Length; i++)
+                {
+                    string s = toOverrideStrFIs[i].GetValue(ov) as string;
+                    if (string.IsNullOrEmpty(s)) continue;
+                    if (s.IndexOf(lobbyName, StringComparison.OrdinalIgnoreCase) < 0) continue; // not the name field
+                    Match m = Regex.Match(s, "<(?:color=)?#([0-9A-Fa-f]{6})>");
+                    if (m.Success) return m.Groups[1].Value.ToUpperInvariant();
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static string ColorToHex(Color c)
+        {
+            return string.Format("{0:X2}{1:X2}{2:X2}",
+                Mathf.RoundToInt(Mathf.Clamp01(c.r) * 255f),
+                Mathf.RoundToInt(Mathf.Clamp01(c.g) * 255f),
+                Mathf.RoundToInt(Mathf.Clamp01(c.b) * 255f));
+        }
+
+        // Build the matchup from the live overrides. Returns false when the Showdown mod isn't running
+        // (or hasn't tagged anyone yet), so the steam-id path stays as the fallback.
+        private bool SdDetectFromOverrides()
+        {
+            EnsureTopoutApi();
+            List<ZeepkistNetworkPlayer> list;
+            try { list = ZeepkistNetwork.PlayerList; } catch { return false; }
+            if (list == null) return false;
+
+            Dictionary<string, List<ZeepkistNetworkPlayer>> byCol = new Dictionary<string, List<ZeepkistNetworkPlayer>>();
+            foreach (ZeepkistNetworkPlayer p in list)
+            {
+                string hex = SdOverrideTeamColor(p.SteamID, SafeName(p));
+                if (hex == null) continue;
+                List<ZeepkistNetworkPlayer> l;
+                if (!byCol.TryGetValue(hex, out l)) { l = new List<ZeepkistNetworkPlayer>(); byCol[hex] = l; }
+                l.Add(p);
+            }
+            if (byCol.Count < 2) return false; // one colour (or none) is not a matchup
+
+            string hexA = null, hexB = null;
+            int nA = 0, nB = 0;
+            foreach (KeyValuePair<string, List<ZeepkistNetworkPlayer>> kv in byCol)
+            {
+                if (kv.Value.Count > nA) { hexB = hexA; nB = nA; hexA = kv.Key; nA = kv.Value.Count; }
+                else if (kv.Value.Count > nB) { hexB = kv.Key; nB = kv.Value.Count; }
+            }
+            if (hexA == null || hexB == null) return false;
+            // Stable sides: order by colour so the card doesn't flip when counts change.
+            if (string.CompareOrdinal(hexA, hexB) > 0) { string t = hexA; hexA = hexB; hexB = t; }
+
+            string sig = hexA + ":" + SdSig(byCol[hexA]) + "|" + hexB + ":" + SdSig(byCol[hexB]);
+            if (sig == sdOvSig && sdA == sdOvA && sdB == sdOvB) return true; // unchanged
+            sdOvSig = sig;
+
+            if (sdOvA == null) { sdOvA = new SdTeam(); sdOvB = new SdTeam(); }
+            SdFillOverrideTeam(sdOvA, hexA, byCol[hexA]);
+            SdFillOverrideTeam(sdOvB, hexB, byCol[hexB]);
+
+            bool changed = sdA != sdOvA || sdB != sdOvB || sdOvNewMatch;
+            sdOvNewMatch = false;
+            sdA = sdOvA; sdB = sdOvB;
+            if (changed)
+            {
+                sdPtsA = 0; sdPtsB = 0; sdScored.Clear();
+                sdPickerTag = null; sdPickerRandom = false;
+            }
+            sdPbKey = null; // roster changed -> refetch PBs
+            Logger.LogInfo(string.Format("[sd] teams from Showdown overrides: {0} ({1}) v {2} ({3})",
+                sdOvA.Tag, sdOvA.Players.Count, sdOvB.Tag, sdOvB.Players.Count));
+            return true;
+        }
+
+        private static string SdSig(List<ZeepkistNetworkPlayer> l)
+        {
+            List<string> ids = new List<string>();
+            foreach (ZeepkistNetworkPlayer p in l) ids.Add(p.SteamID.ToString(CultureInfo.InvariantCulture));
+            ids.Sort(StringComparer.Ordinal);
+            return string.Join(",", ids.ToArray());
+        }
+
+        // Name/tag come from our pool when the colour matches a known team; otherwise the team still
+        // works, just with a generated tag - which is exactly what lets an unregistered team cast fine.
+        private void SdFillOverrideTeam(SdTeam t, string hex, List<ZeepkistNetworkPlayer> members)
+        {
+            SdTeam known = null;
+            foreach (SdTeam k in sdTeams)
+                if (k.HasCol && ColorToHex(k.Col) == hex) { known = k; break; }
+
+            Color c;
+            t.HasCol = TryParseHexColor("#" + hex, out c);
+            t.Col = t.HasCol ? c : pnameCol;
+            t.Tag = known != null ? known.Tag : ("#" + hex.Substring(0, 3));
+            t.Name = known != null ? known.Name : ("Team " + hex);
+            t.Players.Clear();
+            foreach (ZeepkistNetworkPlayer p in members)
+            {
+                SdPlayer sp = new SdPlayer();
+                sp.SteamId = p.SteamID.ToString(CultureInfo.InvariantCulture);
+                sp.Name = SafeName(p) ?? sp.SteamId;
+                sp.Aliases = new string[0];
+                t.Players.Add(sp);
+            }
+        }
+
+        private SdTeam SdTeamByTag(string tag)
+        {
+            if (string.IsNullOrEmpty(tag)) return null;
+            foreach (SdTeam t in sdTeams)
+                if (string.Equals(t.Tag, tag, StringComparison.OrdinalIgnoreCase)) return t;
+            return null;
+        }
+
+        // Season map currently loaded, matched on the GTR hash (with the same "-N" version tolerance the
+        // WR fetch uses). null when the lobby is on something outside the season pool.
+        private SdMap SdMapForCurrent()
+        {
+            string h = CurrentLevelHash();
+            if (string.IsNullOrEmpty(h)) return null;
+            h = h.ToUpperInvariant();
+            foreach (SdMap m in sdMaps) if (m.Hash == h) return m;
+            string bh = StripHashVersion(h);
+            foreach (SdMap m in sdMaps) if (StripHashVersion(m.Hash) == bh) return m;
+            return null;
+        }
+
+        private static string StripHashVersion(string hash)
+        {
+            if (string.IsNullOrEmpty(hash)) return hash;
+            int dash = hash.LastIndexOf('-');
+            if (dash <= 0 || dash >= hash.Length - 1) return hash;
+            for (int i = dash + 1; i < hash.Length; i++) if (!char.IsDigit(hash[i])) return hash;
+            return hash.Substring(0, dash);
+        }
+
+        // This round's live time for a Showdown player, or -1. Reads the replicated in-lobby leaderboard
+        // (so a non-host caster works) rather than anything COTDTracker-shaped.
+        private float SdLiveTime(SdPlayer p)
+        {
+            if (p == null || string.IsNullOrEmpty(p.SteamId)) return -1f;
+            ulong sid;
+            if (!ulong.TryParse(p.SteamId, NumberStyles.Integer, CultureInfo.InvariantCulture, out sid)) return -1f;
+            return GetRoundTime(sid);
+        }
+
+        // How many of a team's racers have a time this round. This is the FIRST thing that decides a
+        // round in Showdown4 (Round.CompareFinishers) - more finishers wins outright, whatever the
+        // times. It has to exist, because the cumulative time only sums finishers, so without it not
+        // finishing would be an advantage.
+        private int SdFinishers(SdTeam t)
+        {
+            if (t == null) return 0;
+            int n = 0;
+            for (int i = 0; i < t.Players.Count; i++) if (SdLiveTime(t.Players[i]) >= 0f) n++;
+            return n;
+        }
+
+        // Sum of the finishers' times - the second tiebreak (Round.CompareCumulativeTeamTimes).
+        private float SdCumulative(SdTeam t)
+        {
+            if (t == null) return -1f;
+            float sum = 0f; int n = 0;
+            for (int i = 0; i < t.Players.Count; i++)
+            {
+                float v = SdLiveTime(t.Players[i]);
+                if (v >= 0f) { sum += v; n++; }
+            }
+            return n > 0 ? sum : -1f;
+        }
+
+        // Displayed team time: the average OF FINISHERS, matching Showdown4's GetAvgTimeOfTeam (it
+        // divides by finishers, not by team size). -1 only when nobody on the team has a time.
+        private float SdTeamAvg(SdTeam t, bool useProjected)
+        {
+            if (t == null || t.Players.Count == 0) return -1f;
+            float sum = 0f; int n = 0;
+            for (int i = 0; i < t.Players.Count; i++)
+            {
+                float v = -1f;
+                if (useProjected)
+                {
+                    // The PB projection is a pre-race estimate, so it only means anything with every
+                    // racer's PB known - a partial one would flatter whoever is missing.
+                    if (!sdPb.TryGetValue(t.Players[i].SteamId ?? "", out v)) return -1f;
+                }
+                else v = SdLiveTime(t.Players[i]);
+                if (v < 0f) { if (useProjected) return -1f; continue; }
+                sum += v; n++;
+            }
+            return n > 0 ? sum / n : -1f;
+        }
+
+        // Showdown4's Round.Evaluate cascade, in order: finishers -> cumulative time -> individual
+        // placements -> random. We stop before "random": a coin flip must not appear on a broadcast as
+        // if it were a result, so a true dead heat stays undecided and the caster awards it.
+        // Returns -1 when team A leads, +1 when B leads, 0 when undecided.
+        private int SdCompare(out string method, out float gap)
+        {
+            method = null; gap = -1f;
+            if (sdA == null || sdB == null) return 0;
+
+            int fa = SdFinishers(sdA), fb = SdFinishers(sdB);
+            if (fa == 0 && fb == 0) return 0;
+            if (fa != fb) { method = "finishers " + Math.Max(fa, fb) + "-" + Math.Min(fa, fb); return fa > fb ? -1 : 1; }
+
+            float ca = SdCumulative(sdA), cb = SdCumulative(sdB);
+            if (ca >= 0f && cb >= 0f && ca != cb)
+            {
+                method = "time";
+                gap = Mathf.Abs(sdAvgA - sdAvgB); // report the gap in the units the card displays
+                return ca < cb ? -1 : 1;
+            }
+
+            // Fastest-vs-fastest, then second-vs-second.
+            List<float> la = SdSortedTimes(sdA), lb = SdSortedTimes(sdB);
+            int n = Mathf.Min(la.Count, lb.Count);
+            for (int i = 0; i < n; i++)
+            {
+                if (la[i] == lb[i]) continue;
+                method = i == 0 ? "fastest lap" : "2nd lap";
+                gap = Mathf.Abs(la[i] - lb[i]);
+                return la[i] < lb[i] ? -1 : 1;
+            }
+            return 0;
+        }
+
+        private List<float> SdSortedTimes(SdTeam t)
+        {
+            List<float> r = new List<float>();
+            if (t == null) return r;
+            for (int i = 0; i < t.Players.Count; i++)
+            {
+                float v = SdLiveTime(t.Players[i]);
+                if (v >= 0f) r.Add(v);
+            }
+            r.Sort();
+            return r;
+        }
+
+        // Recompute everything the card renders. Runs on the 5 Hz Update poll so OnGUI only formats.
+        private void SdRefresh()
+        {
+            if (sdDebugTeams) SdRebuildDebugTeams(); // track players joining/leaving during a test
+            SdDetectMatchup(false);
+            sdCurMap = SdMapForCurrent();
+
+            // The picker is per-map, so a new map must clear it. Without this the header would carry
+            // "(AgOH pick)" onto the next round's map and quietly lie on stream.
+            string mh = CurrentLevelHash();
+            if (mh != sdLastMapHash)
+            {
+                sdLastMapHash = mh;
+                sdPickerTag = null; sdPickerRandom = false;
+            }
+
+            sdAvgA = SdTeamAvg(sdA, false);
+            sdAvgB = SdTeamAvg(sdB, false);
+            sdProjA = SdTeamAvg(sdA, true);
+            sdProjB = SdTeamAvg(sdB, true);
+            sdFinA = SdFinishers(sdA);
+            sdFinB = SdFinishers(sdB);
+            sdLead = SdCompare(out sdLeadMethod, out sdLeadGap);
+        }
+
+        // Award the round to whoever has the better average. Idempotent per map hash so a re-fired
+        // RoundEnded (or a rejoin) can't double-score, and silent unless both teams are complete.
+        private void SdTryScoreRound()
+        {
+            if (castMode != CastMode.Showdown || sdA == null || sdB == null) return;
+            if (sdLead == 0) return; // nobody finished, or a genuine dead heat -> caster awards it
+            string key = CurrentLevelHash();
+            if (string.IsNullOrEmpty(key)) return;
+            if (!sdScored.Add(key)) return;
+            if (sdLead < 0) sdPtsA++; else sdPtsB++;
+            Logger.LogInfo(string.Format(
+                "[sd] round on {0} to {1} (by {2}): {3} {4:0.000} [{5} fin] - {6:0.000} [{7} fin] {8}  =>  {9} {10} - {11} {12}",
+                sdCurMap != null ? sdCurMap.Name : key, sdLead < 0 ? sdA.Tag : sdB.Tag, sdLeadMethod,
+                sdA.Tag, sdAvgA, sdFinA, sdAvgB, sdFinB, sdB.Tag,
+                sdA.Tag, sdPtsA, sdPtsB, sdB.Tag));
+        }
+
+        // ---- GTR personal bests for the four racers on the current map ------------------------------
+        // One query covers the whole matchup. Verified query shape (personalBestGlobals is one row per
+        // user+level, so no dedupe needed):
+        //   {levels(filter:{hash:{equalTo:"HASH"}}){nodes{
+        //      personalBestGlobals(filter:{user:{steamId:{in:["..",".."]}}}){
+        //        nodes{user{steamId steamName} record{time}}}}}}
+
+        private void MaybeFetchSdPbs()
+        {
+            if (sdPbFetching) return;
+            if (sdA == null || sdB == null) return;
+            string hash = CurrentLevelHash();
+            if (string.IsNullOrEmpty(hash)) return;
+
+            List<string> sids = new List<string>();
+            for (int side = 0; side < 2; side++)
+            {
+                SdTeam t = side == 0 ? sdA : sdB;
+                foreach (SdPlayer p in t.Players)
+                    if (!string.IsNullOrEmpty(p.SteamId) && !sids.Contains(p.SteamId)) sids.Add(p.SteamId);
+            }
+            if (sids.Count == 0) return;
+            sids.Sort(StringComparer.Ordinal);
+            string key = hash.ToUpperInvariant() + "|" + string.Join(",", sids.ToArray());
+            if (key == sdPbKey) return; // already have it (or already tried) for this map + roster
+
+            sdPbFetching = true;
+            sdPbKey = key;              // claim now so the poll doesn't re-fire; result commits via pending
+            sdPb.Clear();               // drop the previous map's PBs immediately
+            string hashUp = hash.ToUpperInvariant();
+            string[] sidArr = sids.ToArray();
+            Logger.LogInfo("[sd] PB fetch start for hash " + hashUp + " (" + sidArr.Length + " racers)");
+            System.Threading.Thread th = new System.Threading.Thread(delegate ()
+            {
+                Dictionary<string, float> res = null;
+                try { res = FetchSdPbsBlocking(hashUp, sidArr); }
+                catch { res = null; }
+                sdPbPendingMap = res; sdPbPendingKey = key; sdPbPending = true;
+            });
+            th.IsBackground = true;
+            try { th.Start(); }
+            catch { sdPbFetching = false; }
+        }
+
+        private Dictionary<string, float> FetchSdPbsBlocking(string hashUpper, string[] sids)
+        {
+            Dictionary<string, float> r = TrySdPbs(hashUpper, sids);
+            if (r != null && r.Count > 0) return r;
+            // Adjusted/versioned levels carry a "-N" suffix; GTR may key the base hash.
+            string bh = StripHashVersion(hashUpper);
+            if (bh != hashUpper)
+            {
+                Dictionary<string, float> r2 = TrySdPbs(bh, sids);
+                if (r2 != null && r2.Count > 0) return r2;
+            }
+            Logger.LogInfo("[sd] no PBs found for hash " + hashUpper);
+            return r;
+        }
+
+        private Dictionary<string, float> TrySdPbs(string hashUpper, string[] sids)
+        {
+            System.Text.StringBuilder inList = new System.Text.StringBuilder();
+            for (int i = 0; i < sids.Length; i++)
+            {
+                if (i > 0) inList.Append(',');
+                inList.Append('"').Append(sids[i].Replace("\\", "\\\\").Replace("\"", "\\\"")).Append('"');
+            }
+            string esc = hashUpper.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            string body = GqlPost("{levels(filter:{hash:{equalTo:\"" + esc + "\"}}){nodes{" +
+                "personalBestGlobals(filter:{user:{steamId:{in:[" + inList + "]}}}){" +
+                "nodes{user{steamId} record{time}}}}}}");
+            if (body == null) { Logger.LogWarning("[sd] GTR PB request failed/timed out for " + hashUpper); return null; }
+            Dictionary<string, float> map = new Dictionary<string, float>();
+            try
+            {
+                JToken nodes = JObject.Parse(body).SelectToken("data.levels.nodes[0].personalBestGlobals.nodes");
+                JArray arr = nodes as JArray;
+                if (arr != null)
+                {
+                    foreach (JToken n in arr)
+                    {
+                        JToken sidTok = n.SelectToken("user.steamId");
+                        JToken tTok = n.SelectToken("record.time");
+                        if (sidTok == null || tTok == null) continue;
+                        map[(string)sidTok] = (float)(double)tTok;
+                    }
+                }
+            }
+            catch (Exception ex) { Logger.LogWarning("[sd] PB parse failed: " + ex.Message); return null; }
+            Logger.LogInfo(string.Format("[sd] {0} -> {1} PBs", hashUpper, map.Count));
+            return map;
+        }
+
+        // A team colour is only a tint here, never a fill, but #000000 (Panthers) still vanishes on the
+        // dark card and #ffefad (Silver Hydroxide) glares. Push very dark colours up and leave the rest.
+        private static Color ReadableOn(Color c)
+        {
+            float lum = 0.299f * c.r + 0.587f * c.g + 0.114f * c.b;
+            if (lum >= 0.35f) return c;
+            if (lum <= 0.02f) return new Color(0.72f, 0.74f, 0.80f); // pure black -> neutral grey
+            float k = 0.35f / Mathf.Max(lum, 0.001f);
+            return new Color(Mathf.Min(c.r * k, 1f), Mathf.Min(c.g * k, 1f), Mathf.Min(c.b * k, 1f));
+        }
+
         private void OnCommand(string args)
         {
             args = (args ?? "").Trim();
             string lower = args.ToLowerInvariant();
+
+            // Any explicit /overlay command (other than turning it off) wakes the mod for this session.
+            if (cfgEnabled != null && !(lower == "off" || lower == "clear" || lower == "hide"))
+                cfgEnabled.Value = true;
 
             if (lower == "off" || lower == "clear" || lower == "hide")
             {
@@ -454,15 +1293,8 @@ namespace LobbyOverlay
                 else ChatApi.AddLocalMessage("Camera sync is " + (camLink ? "on" : "off") + ". Usage: /overlay cam on|off");
                 return;
             }
-            // Runtime toggles for the two BepInEx settings, so they work without a config-manager mod
+            // Runtime toggle for the stay-in-photomode setting, so it works without a config-manager mod
             // (still backed by the .cfg, so the choice persists across restarts).
-            if (lower.StartsWith("mouselock"))
-            {
-                bool? b = ParseOnOff(args.Substring("mouselock".Length));
-                if (b.HasValue) { cfgDisableMouseLook.Value = b.Value; ChatApi.AddLocalMessage("Disable mouse look in photomode: " + (b.Value ? "on" : "off")); }
-                else ChatApi.AddLocalMessage("Mouse-look freeze is " + (cfgDisableMouseLook.Value ? "on" : "off") + ". Usage: /overlay mouselock on|off");
-                return;
-            }
             if (lower.StartsWith("staycam"))
             {
                 bool? b = ParseOnOff(args.Substring("staycam".Length));
@@ -479,7 +1311,7 @@ namespace LobbyOverlay
             if (lower == "panel")
             {
                 TogglePanel();
-                ChatApi.AddLocalMessage("Control panel " + (showPanel ? "open (F4 to toggle)." : "closed."));
+                ChatApi.AddLocalMessage("Control panel " + (showPanel ? "open." : "closed (mod still on; F4 turns the mod off)."));
                 return;
             }
             if (lower == "wins" || lower == "roundwins")
@@ -513,7 +1345,8 @@ namespace LobbyOverlay
                 if (c == "cup") { castMode = CastMode.Cup; SaveLayout(); ChatApi.AddLocalMessage("Comp: Cup"); }
                 else if (c == "topout") { castMode = CastMode.Topout; SaveLayout(); ChatApi.AddLocalMessage("Comp: Topout"); }
                 else if (c == "pursuit") { castMode = CastMode.Pursuit; SaveLayout(); ChatApi.AddLocalMessage("Comp: Pursuit"); }
-                else ChatApi.AddLocalMessage("Comp is " + CastLabel(castMode) + ". Options: cup, topout, pursuit");
+                else if (c == "showdown" || c == "sd") { castMode = CastMode.Showdown; SaveLayout(); SdDetectMatchup(true); ChatApi.AddLocalMessage("Comp: Showdown"); }
+                else ChatApi.AddLocalMessage("Comp is " + CastLabel(castMode) + ". Options: cup, topout, pursuit, showdown");
                 return;
             }
             if (lower.StartsWith("stats"))
@@ -536,6 +1369,7 @@ namespace LobbyOverlay
                 if (a == null) { ChatApi.AddLocalMessage("No stats for '" + parts[0] + "'."); return; }
                 if (b == null) { ChatApi.AddLocalMessage("No stats for '" + parts[1] + "'."); return; }
                 target1 = a; target2 = b; mode = Mode.H2H; shownFollowSid = null;
+                droneOn = true; EnsureDrone(); // auto-open the VS compare cam (button still toggles)
                 ChatApi.AddLocalMessage(string.Format("H2H: {0} vs {1}", a.Name, b.Name));
                 return;
             }
@@ -566,7 +1400,151 @@ namespace LobbyOverlay
                 ChatApi.AddLocalMessage("Times: " + key);
                 return;
             }
-            ChatApi.AddLocalMessage("Usage: /overlay panel (F4) | stats <name> | h2h <a> <b> | times <name> | pool <comp> | comp cup|topout|pursuit | cam on|off | mouselock on|off | staycam on|off | camstate | reset | resetpos | test | off");
+            if (lower == "sd" || lower.StartsWith("sd "))
+            {
+                HandleSdCommand(args.Length > 2 ? args.Substring(2).Trim() : "");
+                return;
+            }
+            if (lower == "help" || lower == "?" || lower == "commands")
+            {
+                ChatApi.AddLocalMessage("Tournament Casting UI - F4 = master on/off, F5 = clear cards.");
+                ChatApi.AddLocalMessage("View: /overlay panel | stats <name> | h2h <a> <b> | times <name> | wins | test | off");
+                ChatApi.AddLocalMessage("Setup: /overlay comp cup|topout|pursuit|showdown | pool <comp> | elim <N> | resetpos");
+                ChatApi.AddLocalMessage("Camera: /overlay cam on|off | staycam on|off | camstate");
+                ChatApi.AddLocalMessage("Showdown: most controls are BUTTONS in the panel (no typing needed).");
+                ChatApi.AddLocalMessage("Showdown: /overlay sd (state) | sd debug (fake teams from lobby) | sd <tagA> <tagB> | sd auto | sd reset");
+                return;
+            }
+            ChatApi.AddLocalMessage("F4 = master on/off. /overlay help for the full list. Quick: panel | stats <name> | h2h <a> <b> | times <name> | comp showdown | sd | off");
+        }
+
+        // Everything a caster might need to correct live. The mod auto-detects the matchup and scores
+        // rounds on its own, so these are only for when reality drifts: a substitute nobody registered,
+        // a mis-detected pairing, a round the game didn't end cleanly.
+        private void HandleSdCommand(string rest)
+        {
+            rest = (rest ?? "").Trim();
+            string low = rest.ToLowerInvariant();
+
+            if (rest.Length == 0)
+            {
+                if (castMode != CastMode.Showdown) ChatApi.AddLocalMessage("Showdown mode is off. Turn it on with /overlay comp showdown");
+                if (sdTeams.Count == 0) { ChatApi.AddLocalMessage("No showdown pool loaded (showdown_pool.json)."); return; }
+                if (sdA == null || sdB == null)
+                {
+                    ChatApi.AddLocalMessage(string.Format("Pool: season {0}, {1} teams, {2} maps. No matchup detected yet.",
+                        sdSeason, sdTeams.Count, sdMaps.Count));
+                    return;
+                }
+                ChatApi.AddLocalMessage(string.Format("{0} {1} - {2} {3}   ({4})   teams from: {5}",
+                    sdA.Tag, sdPtsA, sdPtsB, sdB.Tag,
+                    sdCurMap != null ? ("#" + sdCurMap.N + " " + sdCurMap.Name) : "off-pool map",
+                    SdTeamSource()));
+                ChatApi.AddLocalMessage(string.Format("avg: {0} {1}  |  {2} {3}",
+                    sdA.Tag, sdAvgA >= 0f ? sdAvgA.ToString("0.000", CultureInfo.InvariantCulture) : "--",
+                    sdB.Tag, sdAvgB >= 0f ? sdAvgB.ToString("0.000", CultureInfo.InvariantCulture) : "--"));
+                return;
+            }
+
+            if (low == "reset")
+            {
+                sdPtsA = 0; sdPtsB = 0; sdScored.Clear(); sdPickerTag = null; sdPickerRandom = false;
+                ChatApi.AddLocalMessage("Showdown: new match (score and picks cleared).");
+                return;
+            }
+            if (low == "auto")
+            {
+                sdMatchupForced = false; sdRosterSig = null; SdDetectMatchup(true);
+                ChatApi.AddLocalMessage(sdA != null && sdB != null
+                    ? ("Showdown: auto-detect on -> " + sdA.Tag + " vs " + sdB.Tag)
+                    : "Showdown: auto-detect on (no matchup detected yet).");
+                return;
+            }
+            if (low == "random")
+            {
+                sdPickerRandom = true; sdPickerTag = null;
+                ChatApi.AddLocalMessage("Showdown: current map marked as randomised.");
+                return;
+            }
+            if (low.StartsWith("pick"))
+            {
+                string tag = rest.Substring(4).Trim();
+                SdTeam t = SdTeamByTag(tag);
+                if (t == null) { ChatApi.AddLocalMessage("Unknown team tag '" + tag + "'. Usage: /overlay sd pick <tag>"); return; }
+                sdPickerTag = t.Tag; sdPickerRandom = false;
+                ChatApi.AddLocalMessage("Showdown: current map picked by " + t.Tag + ".");
+                return;
+            }
+            if (low.StartsWith("score"))
+            {
+                string[] parts = SplitTwo(rest.Substring(5).Trim());
+                int a, b;
+                if (parts == null ||
+                    !int.TryParse(parts[0], out a) || !int.TryParse(parts[1], out b) ||
+                    a < 0 || b < 0)
+                { ChatApi.AddLocalMessage("Usage: /overlay sd score <a> <b>"); return; }
+                sdPtsA = a; sdPtsB = b;
+                ChatApi.AddLocalMessage(string.Format("Showdown score set: {0} {1} - {2} {3}",
+                    sdA != null ? sdA.Tag : "A", a, b, sdB != null ? sdB.Tag : "B"));
+                return;
+            }
+            if (low == "debug")
+            {
+                castMode = CastMode.Showdown; SaveLayout();
+                SdToggleDebugTeams();
+                return;
+            }
+            if (low.StartsWith("move"))
+            {
+                // Prefer the panel buttons for this - the game has no clipboard, so typing a name mid-cast
+                // is painful. Kept for scripted/setup use.
+                string all = rest.Substring(4).Trim();
+                int sp = all.LastIndexOf(' ');
+                if (sp <= 0) { ChatApi.AddLocalMessage("Select a player in the panel and use the team buttons, or: /overlay sd move <player> <tag>"); return; }
+                string who = all.Substring(0, sp).Trim();
+                SdTeam t = SdTeamByTag(all.Substring(sp + 1).Trim());
+                if (t == null) { ChatApi.AddLocalMessage("Unknown team tag."); return; }
+                string sid = SdResolveSid(who);
+                if (sid == null) { ChatApi.AddLocalMessage("No player in the lobby matching '" + who + "'."); return; }
+                SdMoveSid(sid, t);
+                return;
+            }
+
+            // "sd <tagA> <tagB>" - pin the matchup.
+            string[] tags = SplitTwo(rest);
+            if (tags != null)
+            {
+                SdTeam ta = SdTeamByTag(tags[0]);
+                SdTeam tb = SdTeamByTag(tags[1]);
+                if (ta == null) { ChatApi.AddLocalMessage("Unknown team tag '" + tags[0] + "'."); return; }
+                if (tb == null) { ChatApi.AddLocalMessage("Unknown team tag '" + tags[1] + "'."); return; }
+                if (ta == tb) { ChatApi.AddLocalMessage("Pick two different teams."); return; }
+                sdA = ta; sdB = tb; sdMatchupForced = true;
+                sdPtsA = 0; sdPtsB = 0; sdScored.Clear(); sdPickerTag = null; sdPickerRandom = false;
+                sdPbKey = null;
+                castMode = CastMode.Showdown; SaveLayout();
+                ChatApi.AddLocalMessage("Showdown: " + ta.Tag + " vs " + tb.Tag + " (pinned; /overlay sd auto to unpin)");
+                return;
+            }
+
+            ChatApi.AddLocalMessage("Usage: /overlay sd | sd debug | sd <tagA> <tagB> | sd auto | sd score <a> <b> | sd pick <tag> | sd random | sd reset  (most of this is buttons in the panel)");
+        }
+
+        // Steam id for a typed name from the LIVE lobby roster. Unlike Resolve() this doesn't require
+        // the player to be in the stats pool, which is the whole point: a last-minute substitute won't be.
+        private string SdResolveSid(string query)
+        {
+            try
+            {
+                List<ZeepkistNetworkPlayer> list = ZeepkistNetwork.PlayerList;
+                if (list == null) return null;
+                string q = query.Trim().ToLowerInvariant();
+                ZeepkistNetworkPlayer hit = MatchRoster(list, q, 0);
+                if (hit == null) hit = MatchRoster(list, q, 1);
+                if (hit == null) hit = MatchRoster(list, q, 2);
+                return hit == null ? null : hit.SteamID.ToString(CultureInfo.InvariantCulture);
+            }
+            catch { return null; }
         }
 
         // Parse an on/off argument (also accepts 1/0, true/false). null = neither (show current state).
@@ -690,6 +1668,7 @@ namespace LobbyOverlay
                 if (cupOver) ResetLive();
                 pendingRound = true;
                 roundTimes.Clear();
+                curRoundMapUid = null; // round boundary: re-arm map capture (robust to an abandoned round)
                 return;
             }
 
@@ -697,6 +1676,22 @@ namespace LobbyOverlay
             if (m.Success)
             {
                 roundTimes[m.Groups[1].Value.Trim()] = m.Groups[2].Value.Trim();
+                // First time of the round: freeze the map this round is on (players have raced, so the
+                // lobby is still on this level -> no race with the host advancing to the next map).
+                if (curRoundMapUid == null)
+                {
+                    string uid = CurrentLevelUid();
+                    if (!string.IsNullOrEmpty(uid))
+                    {
+                        curRoundMapUid = uid;
+                        if (!mapNames.ContainsKey(uid))
+                        {
+                            string nm = CurrentLevelName();
+                            mapNames[uid] = string.IsNullOrEmpty(nm) ? uid : nm;
+                            mapOrder.Add(uid);
+                        }
+                    }
+                }
                 return;
             }
 
@@ -725,8 +1720,9 @@ namespace LobbyOverlay
                         list = new List<RoundTime>();
                         playerRoundTimes[kv.Key] = list;
                     }
-                    list.Add(new RoundTime(liveRound, kv.Value));
+                    list.Add(new RoundTime(liveRound, kv.Value, curRoundMapUid));
                 }
+                curRoundMapUid = null; // re-arm: next round captures its own map on the first time
                 return;
             }
 
@@ -746,6 +1742,9 @@ namespace LobbyOverlay
             roundTimes.Clear();
             playerRoundTimes.Clear();
             eliminatedLive.Clear();
+            curRoundMapUid = null;
+            mapNames.Clear();
+            mapOrder.Clear();
         }
 
         // Tag-tolerant match of a lobby name against a set of COTDTracker names (logged without the
@@ -795,11 +1794,67 @@ namespace LobbyOverlay
                 string j = pendingPoolJson; pendingPoolJson = null;
                 ApplyFetchedPool(j);
             }
+            if (pendingSdJson != null)
+            {
+                string j = pendingSdJson; pendingSdJson = null;
+                ApplySdPool(j, "repo");
+            }
 
-            // F4 toggles the control panel (no typing needed mid-cast); F5 clears everything.
+            // Commit a finished Showdown PB fetch from the background thread.
+            if (sdPbPending)
+            {
+                sdPbPending = false;
+                sdPbFetching = false;
+                Dictionary<string, float> m = sdPbPendingMap;
+                if (sdPbPendingKey != null && sdPbPendingKey == sdPbKey && m != null)
+                {
+                    sdPb.Clear();
+                    foreach (KeyValuePair<string, float> kv in m) sdPb[kv.Key] = kv.Value;
+                }
+            }
+
+            // Commit a finished world-record fetch from the background thread.
+            if (wrPending)
+            {
+                wrPending = false;
+                wrFetching = false;
+                if (wrPendingUid != null && wrPendingUid == wrUid)
+                {
+                    wrHolder = wrPendingHolder != null ? wrPendingHolder : "";
+                    wrTime = wrPendingTime != null ? wrPendingTime : "";
+                }
+            }
+
+            // Master enable gate. OFF by default and re-armed OFF each launch, so the mod is fully
+            // dormant (nothing renders, no camera tracking) until the caster opts in - this is what
+            // stops a racer who merely installed it from seeing stat cards when they cycle photomode.
+            bool en = cfgEnabled != null && cfgEnabled.Value;
+            if (en != enabledApplied)
+            {
+                enabledApplied = en;
+                // wipe + hand the mouse back on the on->off edge (Update returns early while off, so the
+                // per-frame mouse-look reconcile won't run to restore a frozen sensitivity otherwise).
+                if (!en) { showPanel = false; try { ClearAll(); } catch { } try { FreezeMouseLook(false); } catch { } }
+            }
+            if (!en)
+            {
+                // Dormant: the panel key (or the menu tick / a /overlay command) is the only thing that
+                // wakes it. No rendering, no FindObjectOfType, no drone reflection while off.
+                try { if (cfgEnabled != null && Input.GetKeyDown(cfgKeyPanel != null ? cfgKeyPanel.Value : KeyCode.F4)) { cfgEnabled.Value = true; showPanel = true; } }
+                catch { }
+                try { ReconcileCursor(); } catch { } // guarantee the mouse is handed back if it was held
+                return;
+            }
+
+            // F4 is the MASTER switch: while the mod is enabled, pressing it turns the whole mod OFF
+            // (next frame the gate above wipes everything and goes dormant), so nothing renders and
+            // cycling players in photomode can't bring cards back until F4 re-enables. F5 clears the
+            // cards but leaves the mod on. (The click-list can still be hidden mid-cast via
+            // "/overlay panel" without disabling the mod.)
             try
             {
-                if (Input.GetKeyDown(cfgKeyPanel != null ? cfgKeyPanel.Value : KeyCode.F4)) TogglePanel();
+                if (Input.GetKeyDown(cfgKeyPanel != null ? cfgKeyPanel.Value : KeyCode.F4))
+                { cfgEnabled.Value = false; showPanel = false; }
                 if (Input.GetKeyDown(cfgKeyClear != null ? cfgKeyClear.Value : KeyCode.F5)) ClearAll();
             }
             catch { }
@@ -826,8 +1881,29 @@ namespace LobbyOverlay
                     camPollAccum = 0f;
                     // Camera/drone work only matters in photomode; gating it here means zero
                     // FindObjectOfType scans and zero drone reflection while just racing.
-                    if (inPhotoMode) { PollCamera(); EnsureDrone(); }
+                    if (inPhotoMode) { PollCamera(); if (camRestorePending) RestoreCamera(); }
+                    // Drone upkeep runs EVERY tick, in or out of photomode. Both of these destroy by
+                    // drone ID when the scene isn't wanted, and a live PhotoDrone renders a camera
+                    // whether or not anything of ours is on screen - so "hidden" is not good enough,
+                    // it has to be gone. Gating these on inPhotoMode was leaving cameras running.
+                    EnsureDrone();
+                    EnsureQuadDrones();
                     TryEnterPhotomode(); // must run ungated: its whole job is to ENTER photomode
+                    // World record: only fetch while the overlay bar/cards are actually up (the caster is
+                    // casting, not racing) - never on round start, so zero race-time data use or hitches.
+                    if (showPanel || mode != Mode.None) MaybeFetchWr();
+                    // Rebuild the click-list + mode-bar text off the render path (see panelRowsCache).
+                    if (showPanel) { try { panelRowsCache = BuildPanelRows(); } catch { } }
+                    else panelRowsCache = null;
+                    // Showdown state: matchup, live averages, PB projection. Same "compute here, format
+                    // in OnGUI" rule as everything above. Runs before the bar refresh so the bar's
+                    // Showdown lines see this tick's data.
+                    if (castMode == CastMode.Showdown)
+                    {
+                        try { SdRefresh(); } catch { }
+                        if (showPanel || mode != Mode.None || SdMatchLive()) { try { MaybeFetchSdPbs(); } catch { } }
+                    }
+                    if (showPanel || mode != Mode.None || SdMatchLive()) { try { RefreshModeBarLines(); } catch { } }
                 }
             }
             catch { }
@@ -859,11 +1935,12 @@ namespace LobbyOverlay
         }
 
         // Zero the photomode MOUSE look sensitivity while the panel is open (and restore after), so
-        // moving the mouse to click doesn't swing the camera. The controller has its OWN photomode
-        // sensitivity (untouched), and translation/movement is never sensitivity-scaled, so you can
-        // keep flying with the pad while the menu is up. (Camera look = LookAxis * sensitivity, where
-        // the sensitivity is mouse-vs-controller by last-active device; touching the mouse selects
-        // the zeroed mouse one.)
+        // moving the mouse to click doesn't swing the camera. Camera look = LookAxis * sensitivity, and
+        // the game picks mouse-vs-controller sensitivity by LAST-ACTIVE device - so the controller keeps
+        // its own (left alone) and the pad flies normally while the menu is up. The one gap is a
+        // controller being last-active while the mouse is moved (the mouse delta would then ride the
+        // controller sensitivity); the guard below closes it by also zeroing the controller sensitivity
+        // ONLY on frames where the mouse actually moves, restoring it the moment the mouse is still.
         private void FreezeMouseLook(bool freeze)
         {
             try
@@ -887,29 +1964,53 @@ namespace LobbyOverlay
                         Logger.LogInfo(string.Format("[mouselook] freeze ON (mouse sensitivity {0} -> 0)", savedMouseSens));
                     }
                     s.photo_mode_sensitivity = 0f; // re-asserted each frame; LateUpdate reads this
+
+                    // Controller-routing guard: the free-cam picks ONE look sensitivity by last-active
+                    // device, so when a controller is last-active the MOUSE delta is scaled by the
+                    // CONTROLLER sensitivity (which we leave alone so the pad can keep flying). On frames
+                    // where the mouse actually moves we also zero the controller sensitivity, so moving
+                    // the mouse to click can never swing the cam no matter which device the game thinks
+                    // is active; on still-mouse frames we restore it so controller-fly is unaffected.
+                    bool mouseMoved = false;
+                    try { mouseMoved = Input.GetAxisRaw("Mouse X") != 0f || Input.GetAxisRaw("Mouse Y") != 0f; }
+                    catch { }
+                    if (mouseMoved)
+                    {
+                        if (savedCtrlSens < 0f) savedCtrlSens = s.photo_mode_sensitivity_controller;
+                        s.photo_mode_sensitivity_controller = 0f;
+                    }
+                    else if (savedCtrlSens >= 0f)
+                    {
+                        s.photo_mode_sensitivity_controller = savedCtrlSens;
+                        savedCtrlSens = -1f;
+                    }
                 }
-                else if (savedMouseSens >= 0f)
+                else
                 {
-                    s.photo_mode_sensitivity = savedMouseSens;
-                    Logger.LogInfo(string.Format("[mouselook] freeze OFF (restored {0})", savedMouseSens));
-                    savedMouseSens = -1f;
+                    if (savedCtrlSens >= 0f) { s.photo_mode_sensitivity_controller = savedCtrlSens; savedCtrlSens = -1f; }
+                    if (savedMouseSens >= 0f)
+                    {
+                        s.photo_mode_sensitivity = savedMouseSens;
+                        Logger.LogInfo(string.Format("[mouselook] freeze OFF (restored {0})", savedMouseSens));
+                        savedMouseSens = -1f;
+                    }
                 }
             }
             catch (Exception ex) { Logger.LogError("[mouselook] " + ex); }
         }
 
-        // Reconcile the mouse-look freeze every frame. When the setting is on we freeze for the WHOLE
-        // time we're in photomode (not just while the panel is open): the caster looks/flies with the
-        // controller and uses the mouse only to click, so a frozen mouse never swings the camera.
-        // FlyingCameraScript.LateUpdate reads photo_mode_sensitivity each frame (and runs after our
-        // Update), so this per-frame set is what keeps the freeze solid across the game re-reading its
-        // settings. FreezeMouseLook is idempotent (saves/restores once), so the restore branch also
-        // handles leaving photomode or toggling the setting off.
+        // Reconcile the mouse-look freeze every frame, tied to the F4 panel ONLY (not inPhotoMode):
+        // while the panel is open the mouse must NOT swing the free-cam, so the cursor is free to click;
+        // with the panel closed the mouse flies the free-cam normally. Gating on the panel alone (rather
+        // than panel && inPhotoMode) removes a whole failure mode - if the photomode-entered event were
+        // ever missed, inPhotoMode would be stale-false and the freeze would silently never fire. Zeroing
+        // photo_mode_sensitivity outside photomode is harmless (no free-cam is active). The freeze is
+        // opt-out via the "Freeze mouse-look while panel open" setting (default ON); FlyingCameraScript
+        // .LateUpdate reads the sensitivity each frame (after our Update), so this per-frame set keeps it
+        // solid, and FreezeMouseLook(false) restores both mouse and controller sensitivities once.
         private void ReconcileMouseFreeze()
         {
-            bool on = cfgDisableMouseLook != null && cfgDisableMouseLook.Value;
-            // inPhotoMode is event-driven, so this per-frame reconcile no longer needs a FindEFC.
-            FreezeMouseLook(on && inPhotoMode);
+            FreezeMouseLook(cfgFreezeMouse != null && cfgFreezeMouse.Value && showPanel);
         }
 
         private void ToggleSel(string sid, string name)
@@ -974,6 +2075,7 @@ namespace LobbyOverlay
             if (!pool.TryGetValue(selected[1].Sid, out b))
             { b = new Stat(); b.SteamId = selected[1].Sid; b.Name = selected[1].Name; }
             target1 = a; target2 = b; mode = Mode.H2H; shownFollowSid = null;
+            droneOn = true; EnsureDrone(); // forming an H2H auto-opens the VS compare cam (button still toggles)
         }
 
         // ---------------- Photomode follow-camera link ----------------
@@ -1011,6 +2113,10 @@ namespace LobbyOverlay
         {
             inPhotoMode = true;
             holdArmPending = true;
+            // Re-apply the camera mode used last photomode session (trailcam between rounds), unless
+            // the caster opted out of the mod touching the camera (Follow camera mode = None). Done
+            // once, in the poll, after the game has set up its own default camera on entry.
+            camRestorePending = lastCamState >= 0 && cfgFollowCamState != null && cfgFollowCamState.Value != FollowCam.None;
             try { GetFlyingCamera(); } catch { }
         }
 
@@ -1020,8 +2126,19 @@ namespace LobbyOverlay
         // touching the camera immediately.
         private void OnPhotoModeExited()
         {
+            // Capture the camera mode the caster ended on, to restore it on the next entry (trailcam
+            // between rounds). One read here, before we drop fcRef - no per-frame polling needed.
+            try
+            {
+                FlyingCameraScript fcEnd = GetFlyingCamera();
+                if (fcEnd != null) { lastCamState = fcEnd.currentCameraState; lastCamAlt = fcEnd.alternateCameraState; }
+            }
+            catch { }
             inPhotoMode = false;
             fcRef = null;
+            // Remember whether the panel was up so stay-in-photomode can reopen it on the next round's
+            // auto re-entry (otherwise the caster would have to press F4 again every round).
+            if (cfgStayInPhotomode != null && cfgStayInPhotomode.Value) stayPanelWanted = showPanel;
             showPanel = false; // close the panel too; ReconcileCursor then restores the mouse for racing
             try { ClearAll(); } catch { }
         }
@@ -1037,6 +2154,7 @@ namespace LobbyOverlay
             try { ClearAll(); } catch { }
             try { board.Clear(); } catch { }
             try { ResetLive(); } catch { }
+            wrUid = null; wrHolder = ""; wrTime = ""; // forget the map WR; refetched on the next level
         }
 
         // A round started: arm the stay-in-photomode (re)entry. The poll does the actual entering once
@@ -1044,7 +2162,17 @@ namespace LobbyOverlay
         // Clear the live leaderboard at round start so Cup mode begins with everyone timeless (red)
         // until they actually post a time this round - the game may not push an empty board itself.
         private void OnRoundStarted() { stayEnterPending = true; board.Clear(); }
-        private void OnRoundEnded() { stayEnterPending = false; }
+        private void OnRoundEnded()
+        {
+            stayEnterPending = false;
+            // Score the Showdown round here, before OnRoundStarted wipes `board`: this is the last
+            // moment the round's times exist. Refresh first so we score the final averages, not the
+            // ones from up to 200 ms ago.
+            if (castMode == CastMode.Showdown)
+            {
+                try { SdRefresh(); SdTryScoreRound(); } catch { }
+            }
+        }
 
         // Stay-in-photomode: enter photomode as soon as the server allows, once per round, then leave
         // the caster alone (a later manual exit is not re-fought because isPhotoMode clears pending).
@@ -1061,6 +2189,7 @@ namespace LobbyOverlay
                 if (efc.isPhotoMode) { stayEnterPending = false; return; } // already in (any cause): done
                 if (!efc.CanEnablePhotoMode()) return;                     // server not allowing yet: retry
                 efc.ToggleFlyingCamera();                                  // enter (self-guarded too)
+                if (stayPanelWanted) showPanel = true;                     // reopen the caster's F4 panel for the new round
                 // pending clears next tick once isPhotoMode flips true (avoids a double toggle).
             }
             catch { }
@@ -1090,6 +2219,8 @@ namespace LobbyOverlay
             shownFollowSid = null;
             droneOn = false;
             EnsureDrone();                    // close the compare window right away
+            sdQuadOn = false;
+            EnsureQuadDrones();               // ...and every 4x cam feed
             clearHoldSid = CurrentCameraSid();
         }
 
@@ -1130,6 +2261,18 @@ namespace LobbyOverlay
             target1 = s;
             mode = Mode.Stats;
             statsPinned = false;
+        }
+
+        // Re-apply the camera mode captured on the last photomode exit (trailcam between rounds). Runs
+        // once on the first poll after entry - after the game has set its own default camera - then
+        // clears the pending flag, so it never fights a mid-round camera change and does no other work.
+        private void RestoreCamera()
+        {
+            camRestorePending = false;
+            FlyingCameraScript fc = GetFlyingCamera();
+            if (fc == null) return;
+            try { fc.currentCameraState = lastCamState; fc.alternateCameraState = lastCamAlt; }
+            catch { }
         }
 
         // Point the photomode camera at a lobby player (by steam id). No-op (returns false) if the
@@ -1252,19 +2395,24 @@ namespace LobbyOverlay
             try
             {
                 if (!DroneApiReady()) return;
-                // Nothing to create and nothing to tear down -> skip the GetDrone reflection.
-                // (Teardown still runs when the toggle flips off, because droneRef is still set.)
-                if (!droneOn && droneRef == null) return;
-                bool want = droneOn && mode == Mode.H2H && target2 != null &&
+                // Nothing to create and nothing we have EVER created -> skip the GetDrone reflection.
+                // Keyed off "did we ever make one", not off droneRef: PhotoDrone can rebuild the window
+                // behind us, leaving droneRef null while a live drone with our id still renders.
+                if (!droneOn && !vsDroneMade) return;
+                // inPhotoMode is part of `want`: a drone left alive outside photomode still renders a
+                // camera every frame, which is lag while racing for no visible benefit.
+                bool want = droneOn && inPhotoMode && mode == Mode.H2H && target2 != null &&
                             !string.IsNullOrEmpty(target2.SteamId);
                 object drone = pdGetMI.Invoke(null, new object[] { DroneId });
                 bool alive = drone != null && !((UnityEngine.Object)drone == null);
                 if (!want)
                 {
-                    if (alive) pdDestroyMI.Invoke(null, new object[] { drone });
-                    droneRef = null; droneSid = null;
+                    if (alive) { pdDestroyMI.Invoke(null, new object[] { drone }); DroneLog("VS cam destroyed"); }
+                    droneRef = null; droneSid = null; droneAppliedRect = new Rect();
+                    vsDroneMade = false;
                     return;
                 }
+                vsDroneMade = true;
                 if (!alive)
                 {
                     // CreateDrone(null preset) calls SetInitialTarget() -> SetTarget(first lobby
@@ -1317,15 +2465,197 @@ namespace LobbyOverlay
                 // no target that means SetInitialTarget() - the throwy path we just dodged.
                 if (droneSid != null && draggingId == -1 && cardDrawRect.width > 0f)
                 {
-                    // The Sc(40) gap hosts the "VS CAM" title bar drawn by DrawVsCamChrome.
-                    Rect wantRect = new Rect(cardDrawRect.x,
-                                             cardDrawRect.y + cardDrawRect.height + Sc(40f),
-                                             cardDrawRect.width, cardDrawRect.height);
+                    Rect wantRect = DroneWantRect();
                     if (wantRect != droneAppliedRect && ApplyDroneRect(drone, wantRect))
                         droneAppliedRect = wantRect;
                 }
             }
             catch (Exception e) { DroneLog("EnsureDrone: " + Unwrap(e)); }
+        }
+
+        // ---- Showdown 4x cam ("show all") -----------------------------------------------------------
+        // A second, independent multi-drone path rather than a rewrite of the single VS cam: selecting
+        // Showdown must not change camera behaviour, so this only does anything once the operator turns
+        // it on. Targets are the matchup's racers in order (team A top row, team B bottom row); a slot
+        // with no racer simply isn't created, so a 3-player lobby shows 3 feeds.
+        private class QuadSlot
+        {
+            public string Id;
+            public object Ref;
+            public string Sid;
+            public Rect Applied;
+            public string Label;
+        }
+
+        private void EnsureQuadDrones()
+        {
+            try
+            {
+                if (!DroneApiReady()) return;
+                // Nothing on and nothing ever created -> no drones of ours can exist, skip the scan.
+                if (!sdQuadOn && !quadMade) return;
+                bool want = sdQuadOn && castMode == CastMode.Showdown && inPhotoMode &&
+                            (cfgEnabled == null || cfgEnabled.Value) && sdA != null && sdB != null;
+
+                List<SdPlayer> targets = new List<SdPlayer>();
+                List<string> tags = new List<string>();
+                if (want)
+                {
+                    for (int i = 0; i < sdA.Players.Count && targets.Count < 2; i++)
+                    { targets.Add(sdA.Players[i]); tags.Add(sdA.Tag); }
+                    for (int i = 0; i < sdB.Players.Count && targets.Count < 4; i++)
+                    { targets.Add(sdB.Players[i]); tags.Add(sdB.Tag); }
+                }
+
+                // Make sure the slot list exists (4 fixed ids, created/destroyed on demand).
+                while (quadSlots.Count < 4)
+                {
+                    QuadSlot s = new QuadSlot();
+                    s.Id = "lobbyoverlay_sd" + quadSlots.Count;
+                    quadSlots.Add(s);
+                }
+
+                for (int i = 0; i < 4; i++)
+                {
+                    QuadSlot s = quadSlots[i];
+                    // A slot is only wanted if its racer is ACTUALLY IN THE LOBBY. Creating a drone for
+                    // an absent roster entry produced a camera that rendered every frame, could never be
+                    // targeted, and was never even positioned - invisible, but costing frames.
+                    bool slotWanted = i < targets.Count && !string.IsNullOrEmpty(targets[i].SteamId) &&
+                                      FindDronePlayer(targets[i].SteamId) != null;
+                    object drone = pdGetMI.Invoke(null, new object[] { s.Id });
+                    bool alive = drone != null && !((UnityEngine.Object)drone == null);
+
+                    if (!slotWanted)
+                    {
+                        if (alive) { pdDestroyMI.Invoke(null, new object[] { drone }); DroneLog("quad slot destroyed"); }
+                        s.Ref = null; s.Sid = null; s.Applied = new Rect(); s.Label = null;
+                        continue;
+                    }
+                    if (!alive)
+                    {
+                        // Same recovery dance as the VS cam: CreateDrone can throw AFTER registering.
+                        try { drone = pdCreateMI.Invoke(null, new object[] { s.Id, null, false }); }
+                        catch (Exception ce)
+                        {
+                            DroneLog("quad CreateDrone threw (recovering): " + Unwrap(ce));
+                            drone = pdGetMI.Invoke(null, new object[] { s.Id });
+                        }
+                        alive = drone != null && !((UnityEngine.Object)drone == null);
+                        if (!alive) continue; // not possible yet (level loading) - retried next tick
+                    }
+                    quadMade = true;
+                    if (!ReferenceEquals(drone, s.Ref))
+                    {
+                        s.Ref = drone; s.Sid = null; s.Applied = new Rect();
+                        SetupDroneWindow(drone);
+                    }
+                    string sid = targets[i].SteamId;
+                    if (sid != s.Sid)
+                    {
+                        try
+                        {
+                            object pd = FindDronePlayer(sid);
+                            if (pd != null)
+                            {
+                                if (pdFollowModeFI != null && pdSmoothVal != null)
+                                    pdFollowModeFI.SetValue(drone, pdSmoothVal);
+                                pdSetTargetMI.Invoke(drone, new object[] { pd });
+                                s.Sid = sid;
+                            }
+                        }
+                        catch (Exception te) { DroneLog("quad SetTarget failed: " + Unwrap(te)); }
+                    }
+                    s.Label = tags[i] + "  " + SdShortName(targets[i]);
+                    if (s.Sid != null)
+                    {
+                        Rect r = QuadCell(i);
+                        if (r != s.Applied && ApplyDroneRect(drone, r)) s.Applied = r;
+                    }
+                }
+
+                // Once every slot is gone, stop scanning until something is created again.
+                bool anyLeft = false;
+                for (int i = 0; i < quadSlots.Count; i++) if (quadSlots[i].Ref != null) { anyLeft = true; break; }
+                if (!anyLeft) quadMade = false;
+            }
+            catch (Exception e) { DroneLog("EnsureQuadDrones: " + Unwrap(e)); }
+        }
+
+        // The S6 broadcast layout: a 2x2 that takes most of the screen, cells touching, with the right
+        // column left clear for the game's own leaderboard. Sizes itself to the LARGEST 16:9 grid that
+        // fits under the score box, so it adapts to wherever the caster dragged the box and to any
+        // resolution. Cells deliberately share edges - a gap made it read as four widgets instead of
+        // one shot.
+        private Rect QuadCell(int i)
+        {
+            const float RightColumn = 0.21f;   // reserved for the game leaderboard
+            float titleBar = Sc(30f);          // our per-feed name strip sits above each cell
+            float x0 = Sc(12f);
+            float availW = Screen.width * (1f - RightColumn) - x0;
+            float top = (castMode == CastMode.Showdown && sdRect.height > 0f)
+                        ? sdRect.yMax + titleBar + Sc(16f)
+                        : Sc(150f);
+            float availH = Screen.height - top - Sc(16f) - titleBar; // second row needs a strip too
+
+            float cw = availW * 0.5f;
+            float ch = cw * 9f / 16f;
+            if (ch * 2f > availH) { ch = availH * 0.5f; cw = ch * 16f / 9f; }
+
+            float gridW = cw * 2f, gridH = ch * 2f + titleBar;
+            float ox = x0 + Mathf.Max(0f, (availW - gridW) * 0.5f);
+            float oy = top + Mathf.Max(0f, (availH + titleBar - gridH) * 0.5f);
+
+            int col = i % 2, row = i / 2;
+            return new Rect(ox + col * cw, oy + row * (ch + titleBar), cw, ch);
+        }
+
+        private void DrawQuadChrome()
+        {
+            float t = Sc(2f);
+            for (int i = 0; i < quadSlots.Count; i++)
+            {
+                QuadSlot s = quadSlots[i];
+                if (s.Sid == null || s.Applied.width <= 0f) continue;
+                Rect r = s.Applied;
+                Color col = i < 2
+                    ? (sdA != null ? ReadableOn(sdA.Col) : accentCol)
+                    : (sdB != null ? ReadableOn(sdB.Col) : accentCol);
+                Color prev = GUI.color;
+                GUI.color = col;
+                GUI.DrawTexture(new Rect(r.x - t, r.y - t, r.width + 2f * t, t), whiteTex);
+                GUI.DrawTexture(new Rect(r.x - t, r.yMax, r.width + 2f * t, t), whiteTex);
+                GUI.DrawTexture(new Rect(r.x - t, r.y, t, r.height), whiteTex);
+                GUI.DrawTexture(new Rect(r.xMax, r.y, t, r.height), whiteTex);
+                GUI.color = prev;
+                Rect bar = new Rect(r.x, r.y - Sc(30f), r.width, Sc(26f));
+                GUI.Box(bar, GUIContent.none, boxStyle);
+                Rect txt = new Rect(bar.x + Sc(12f), bar.y, bar.width - Sc(24f), bar.height);
+                GUI.contentColor = col;
+                GUI.Label(txt, s.Label ?? "", vsTitleStyle);
+                GUI.contentColor = Color.white;
+            }
+        }
+
+        private bool QuadUp()
+        {
+            if (!sdQuadOn || castMode != CastMode.Showdown) return false;
+            for (int i = 0; i < quadSlots.Count; i++) if (quadSlots[i].Sid != null) return true;
+            return false;
+        }
+
+        private void SdToggleQuad()
+        {
+            sdQuadOn = !sdQuadOn;
+            if (sdQuadOn)
+            {
+                // Mutually exclusive with the single VS cam: five live cameras is not a scene, it's a
+                // framerate problem.
+                droneOn = false;
+                EnsureDrone();
+            }
+            EnsureQuadDrones();
+            ChatApi.AddLocalMessage("Showdown 4x cam: " + (sdQuadOn ? "on" : "off"));
         }
 
         // One line per distinct message for the whole session - enough to diagnose without
@@ -1411,6 +2741,24 @@ namespace LobbyOverlay
         // Move/size the drone window via the same preset path PhotoDrone's own SetRect command
         // uses: pixels, origin top-left, y growing down (same convention as our IMGUI rects).
         // The preset is captured from the live drone, so mode/target are reapplied unchanged.
+        // Where/how big the VS cam window should be: pinned under the card (the Sc(40) gap hosts the
+        // "VS CAM" title bar), sized to the card times droneScale so the caster can shrink it for
+        // performance at high resolutions (rendering a smaller viewport is cheaper).
+        private Rect DroneWantRect()
+        {
+            return new Rect(cardDrawRect.x,
+                            cardDrawRect.y + cardDrawRect.height + Sc(40f),
+                            cardDrawRect.width * droneScale,
+                            cardDrawRect.height * droneScale);
+        }
+
+        // Is the VS cam PiP currently up (so its resize grip should be live/drawn)?
+        private bool VsCamUp()
+        {
+            return mode == Mode.H2H && droneOn && droneAppliedRect.width > 0f &&
+                   droneRef != null && !((UnityEngine.Object)droneRef == null);
+        }
+
         private bool ApplyDroneRect(object drone, Rect r)
         {
             try
@@ -1537,15 +2885,55 @@ namespace LobbyOverlay
 
         // Player's single best time across all captured cup rounds, or null. Matches by name
         // (COTDTracker logs names), so this only has data during a COTDTracker-run cup.
-        private string FastestInCup(string playerName)
+        // Current in-game name for a steam id from the live lobby roster (null if not present).
+        // COTDTracker logs round times under this live name, which can differ from the stale pool
+        // name after a player renames - so this is what we must match the times against.
+        private string LobbyNameForSid(string sid)
         {
-            string key = ResolveLiveName(playerName);
-            if (key == null) return null;
+            if (string.IsNullOrEmpty(sid)) return null;
+            try
+            {
+                List<ZeepkistNetworkPlayer> list = ZeepkistNetwork.PlayerList;
+                if (list == null) return null;
+                foreach (ZeepkistNetworkPlayer p in list)
+                    if (p.SteamID.ToString(CultureInfo.InvariantCulture) == sid) return SafeName(p);
+            }
+            catch { }
+            return null;
+        }
+
+        // Resolve a Stat to its key in playerRoundTimes. Live times are logged by lobby name, so match
+        // by the player's CURRENT lobby name (via steam id) first, then the pool name for players no
+        // longer in the lobby. (Pool-name-only matching broke after renames.)
+        private string LiveTimesKey(Stat s)
+        {
+            if (s == null) return null;
+            string live = LobbyNameForSid(s.SteamId);
+            string key = live != null ? ResolveLiveName(live) : null;
+            if (key == null) key = ResolveLiveName(s.Name);
+            return key;
+        }
+
+        // This player's live per-round times for the current cup (null if none / no match).
+        private List<RoundTime> RoundTimesFor(Stat s)
+        {
+            string key = LiveTimesKey(s);
             List<RoundTime> times;
-            if (!playerRoundTimes.TryGetValue(key, out times) || times == null) return null;
+            if (key != null && playerRoundTimes.TryGetValue(key, out times)) return times;
+            return null;
+        }
+
+        // Fastest lap for an H2H card player, scoped to the map currently up (multi-map cups) so it
+        // compares like-for-like instead of blending both maps. Falls back to overall when no map is known.
+        private string FastestInCup(Stat s)
+        {
+            List<RoundTime> times = RoundTimesFor(s);
+            if (times == null) return null;
+            string curUid = CurrentLevelUid();
             float best = -1f;
             for (int i = 0; i < times.Count; i++)
             {
+                if (curUid != null && times[i].Uid != null && times[i].Uid != curUid) continue; // this map only
                 float t = ParseTime(times[i].Time);
                 if (t >= 0f && (best < 0f || t < best)) best = t;
             }
@@ -1647,6 +3035,7 @@ namespace LobbyOverlay
 
         private void OnGUI()
         {
+            if (cfgEnabled == null || !cfgEnabled.Value) return; // master switch off -> draw nothing
             UpdateScale();
             EnsureStyles();
             HandleDrag();
@@ -1657,6 +3046,7 @@ namespace LobbyOverlay
             if (mode == Mode.H2H && droneOn && droneSid != null && droneAppliedRect.width > 0f &&
                 droneRef != null && !((UnityEngine.Object)droneRef == null))
                 DrawVsCamChrome();
+            if (QuadUp()) DrawQuadChrome();
 
             if (showPanel)
             {
@@ -1666,8 +3056,15 @@ namespace LobbyOverlay
                 DrawPanel();
             }
 
+            // Showdown score box: a permanent broadcast element once a matchup is detected. Before that
+            // it only shows (as a setup hint) while the control panel is open, so a half-configured
+            // "waiting for teams" never sits on stream.
+            if (castMode == CastMode.Showdown && (SdMatchLive() || showPanel)) DrawShowdownCard();
+
             // Always-visible mode bar (when there's anything to control) + drag grips while editing.
-            if (showPanel || mode != Mode.None) DrawModeBar();
+            // In Showdown it carries WR + fastest-this-round, so it stays up for the whole match even
+            // with nothing selected.
+            if (showPanel || mode != Mode.None || SdMatchLive()) DrawModeBar();
             if (showPanel) DrawGrips();
         }
 
@@ -1676,6 +3073,11 @@ namespace LobbyOverlay
         private void DrawCardForMode()
         {
             if (mode == Mode.None) return;
+            // Showdown shows no comp stats at all, so clicking a racer must NOT pop a Stats or H2H card.
+            // `mode`/target1/target2 are still set by the click, because the camera follow and the VS cam
+            // are driven off them - only the card drawing is suppressed. The VS cam re-anchors to the
+            // score box (see DrawShowdownCard), which is what cardDrawRect feeds.
+            if (castMode == CastMode.Showdown) return;
 
             if (mode == Mode.Test)
             {
@@ -1699,7 +3101,10 @@ namespace LobbyOverlay
             if (mode == Mode.H2H && target1 != null && target2 != null)
             {
                 cardRect.width = Sc(410f); cardRect.height = Sc(320f);
-                DrawH2H(cardRect.x, cardRect.y, cardRect.width, target1, target2);
+                // Stats/Times toggle works with two players too: Times shows a side-by-side round-time
+                // comparison instead of the stat card (VS cam / mode stay H2H, only the card swaps).
+                if (timesIntent) DrawTimesH2H(cardRect.x, cardRect.y, cardRect.width, target1, target2);
+                else DrawH2H(cardRect.x, cardRect.y, cardRect.width, target1, target2);
                 return;
             }
 
@@ -1719,24 +3124,310 @@ namespace LobbyOverlay
 
         // The compact always-on mode bar: 3 separate buttons (active one highlighted). It only
         // needs the cursor free to click (same as the panel), but stays visible for at-a-glance mode.
+        // Recompute the mode bar's two text lines. Called from the 5 Hz Update poll, never from OnGUI:
+        // the cup-best scan walks every player's round times, and the bar is drawn on every OnGUI pass.
+        private void RefreshModeBarLines()
+        {
+            // Showdown replaces the whole bar: "Best time" is a COTDTracker cup-best and Round Wins is a
+            // COTD concept, neither of which exists here. Fastest-this-round comes off the live board.
+            if (castMode == CastMode.Showdown)
+            {
+                string fName = null; float fBest = -1f;
+                foreach (KeyValuePair<ulong, LbEntry> kv in board)
+                {
+                    float t = ParseTime(kv.Value.Time);
+                    if (t < 0f || (fBest >= 0f && t >= fBest)) continue;
+                    fBest = t;
+                    fName = LobbyNameForSid(kv.Key.ToString(CultureInfo.InvariantCulture));
+                }
+                if (fName != null && fName.Length > 18) fName = fName.Substring(0, 17) + "..";
+                barBestLine = fBest >= 0f
+                    ? ("Fastest: " + (fName ?? "?") + " - " + fBest.ToString("0.000", CultureInfo.InvariantCulture))
+                    : "Fastest: -";
+                string wrH = wrHolder;
+                if (wrH != null && wrH.Length > 18) wrH = wrH.Substring(0, 17) + "..";
+                barWrLine = !string.IsNullOrEmpty(wrTime)
+                    ? ("WR: " + (string.IsNullOrEmpty(wrH) ? "" : wrH + " - ") + wrTime)
+                    : "WR: -";
+                return;
+            }
+
+            // Cup best, scoped to the map currently up (alternating multi-map cups): "-" until a time
+            // is set. Labeled with the map name inline so it's clear which map the best belongs to.
+            string curUid = CurrentLevelUid();
+            string bestName, bestTime;
+            bool hasBest = TryChampionshipBestForMap(curUid, out bestName, out bestTime);
+            if (hasBest && bestName != null && bestName.Length > 18) bestName = bestName.Substring(0, 17) + "..";
+            string bestMapName = null;
+            if (curUid != null) mapNames.TryGetValue(curUid, out bestMapName);
+            if (bestMapName != null && bestMapName.Length > 18) bestMapName = bestMapName.Substring(0, 17) + "..";
+            string bestPrefix = string.IsNullOrEmpty(bestMapName) ? "Best time:" : ("Best (" + bestMapName + "):");
+            barBestLine = hasBest
+                ? (bestPrefix + " " + bestName + " - " + FmtClock(bestTime))
+                : (bestPrefix + " -");
+
+            // Map world record (GTR): a separate line, since topout doesn't persist a cup-best.
+            string wrHolderShort = wrHolder;
+            if (wrHolderShort != null && wrHolderShort.Length > 18) wrHolderShort = wrHolderShort.Substring(0, 17) + "..";
+            barWrLine = !string.IsNullOrEmpty(wrTime)
+                ? ("WR: " + (string.IsNullOrEmpty(wrHolderShort) ? "" : wrHolderShort + " - ") + wrTime)
+                : "WR: -";
+        }
+
         private void DrawModeBar()
         {
-            float w = Sc(300f), h = Sc(72f);
+            string bestLine = barBestLine != null ? barBestLine : "Best time: -";
+            string wrLine = barWrLine != null ? barWrLine : "WR: -";
+
+            // In Showdown the three cup buttons are meaningless (Round Wins is a COTD cup concept and
+            // Stats/Times both read COTDTracker data that doesn't exist here), so the bar collapses to
+            // just the two live lines.
+            bool sdBar = castMode == CastMode.Showdown;
+            float w = Sc(300f), h = sdBar ? Sc(76f) : Sc(124f);
             if (barRect.x < 0f) { barRect.x = Sc(24f); barRect.y = Screen.height - h - Sc(120f); } // bottom-left default
             barRect.width = w; barRect.height = h;
 
-            bool rwActive = mode == Mode.RoundWins;
-            bool timesActive = !rwActive && timesIntent;
-            bool statsActive = !rwActive && !timesIntent;
-
             GUILayout.BeginArea(barRect, boxStyle);
-            GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Stats", statsActive ? buttonSelStyle : buttonStyle)) SetBarMode(false);
-            if (GUILayout.Button("Times", timesActive ? buttonSelStyle : buttonStyle)) SetBarMode(true);
-            if (GUILayout.Button("Round Wins", rwActive ? buttonSelStyle : buttonStyle))
-            { mode = Mode.RoundWins; shownFollowSid = null; }
-            GUILayout.EndHorizontal();
+            if (!sdBar)
+            {
+                bool rwActive = mode == Mode.RoundWins;
+                bool timesActive = !rwActive && timesIntent;
+                bool statsActive = !rwActive && !timesIntent;
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button("Stats", statsActive ? buttonSelStyle : buttonStyle)) SetBarMode(false);
+                if (GUILayout.Button("Times", timesActive ? buttonSelStyle : buttonStyle)) SetBarMode(true);
+                if (GUILayout.Button("Round Wins", rwActive ? buttonSelStyle : buttonStyle))
+                { mode = Mode.RoundWins; shownFollowSid = null; }
+                GUILayout.EndHorizontal();
+            }
+            GUILayout.Label(bestLine, bestStyle); // cup best (COTD) / fastest this round (Showdown)
+            GUILayout.Label(wrLine, bestStyle);   // map world record (GTR)
             GUILayout.EndArea();
+        }
+
+        // ---- Showdown score box --------------------------------------------------------------------
+        // A permanent broadcast element (like the S6 stream's score box), not one of the click-cards:
+        // it has its own rect so Stats/H2H/Times keep working underneath it. Everything here is
+        // pre-computed by SdRefresh on the Update poll - this only formats.
+        private void DrawShowdownCard()
+        {
+            bool haveMatch = sdA != null && sdB != null;
+            int rowsA = haveMatch ? sdA.Players.Count : 0;
+            int rowsB = haveMatch ? sdB.Players.Count : 0;
+
+            // With a cam scene running the box collapses to the S6 broadcast form (score + the two team
+            // times + the gap). The per-racer PB/skill detail is worth a lot when the box is the only
+            // thing on screen, and worth nothing when it's stealing room from four camera feeds.
+            bool compact = QuadUp();
+
+            float w = compact ? Sc(560f) : Sc(420f); // narrower since the skill column came out
+            float h = !haveMatch
+                ? Sc(32f) + Sc(12f) + Sc(30f) + Sc(26f)
+                : (compact
+                    ? Sc(32f) + Sc(12f) + 2 * Sc(27f) + Sc(26f)
+                    : Sc(32f) + Sc(24f) + Sc(12f) + (rowsA + rowsB) * Sc(27f) + 2 * Sc(27f)
+                      + Sc(14f) + Sc(32f) + Sc(26f));
+            if (sdRect.x < 0f) { sdRect.x = Sc(24f); sdRect.y = Sc(130f); }
+            sdRect.width = w; sdRect.height = h;
+            // The VS cam pins itself under cardDrawRect; with the stat cards suppressed in Showdown, the
+            // score box becomes its anchor so the PiP still lands somewhere sensible.
+            cardDrawRect = sdRect;
+
+            GUILayout.BeginArea(sdRect, boxStyle);
+
+            if (!haveMatch)
+            {
+                GUILayout.Label("Showdown", headerStyle);
+                AccentLine(accentCol, null);
+                GUI.contentColor = dimColor;
+                GUILayout.Label(sdTeams.Count == 0
+                    ? "No showdown_pool.json loaded."
+                    : "Waiting for two teams in the lobby...", sdSubStyle);
+                GUI.contentColor = Color.white;
+                GUILayout.EndArea();
+                return;
+            }
+
+            // Line 1: "STBN 0 - 0 AgOH". Line 2: the round/map. Keeping the map off the tag row is what
+            // stopped both from wrapping and un-cramped the whole box.
+            Color ca = ReadableOn(sdA.Col), cb = ReadableOn(sdB.Col);
+            GUILayout.BeginHorizontal();
+            GUI.contentColor = ca;
+            GUILayout.Label(sdA.Tag, sdTagStyle, GUILayout.Width(Sc(120f)));
+            GUI.contentColor = Color.white;
+            GUILayout.Label(sdPtsA + " - " + sdPtsB, sdScoreStyle, GUILayout.Width(Sc(76f)));
+            GUI.contentColor = cb;
+            GUILayout.Label(sdB.Tag, sdTagStyle, GUILayout.Width(Sc(120f)));
+            GUI.contentColor = Color.white;
+            GUILayout.FlexibleSpace();
+            if (compact)
+            {
+                // Compact has no second line to spare, so the map rides the header row.
+                GUI.contentColor = dimColor;
+                GUILayout.Label(SdMapLine(), sdSubStyle);
+                GUI.contentColor = Color.white;
+            }
+            GUILayout.EndHorizontal();
+
+            if (compact)
+            {
+                AccentLine(ca, cb);
+                SdCompactRows(ca, cb);
+                GUILayout.EndArea();
+                return;
+            }
+
+            GUI.contentColor = dimColor;
+            GUILayout.Label(SdMapLine(), sdSubStyle);
+            GUI.contentColor = Color.white;
+            AccentLine(ca, cb);
+
+            SdTeamBlock(sdA, ca, sdAvgA);
+            GUILayout.Space(Sc(10f));
+            SdTeamBlock(sdB, cb, sdAvgB);
+
+            // Footer: the live gap, or the GTR-PB projection until both teams are complete.
+            GUILayout.Space(Sc(6f));
+            string foot; Color footCol = dimColor;
+            if (sdPtsA >= sdTarget || sdPtsB >= sdTarget)
+            {
+                SdTeam won = sdPtsA >= sdTarget ? sdA : sdB;
+                foot = won.Tag + " wins the match";
+                footCol = ReadableOn(won.Col);
+            }
+            else if (sdLead != 0)
+            {
+                SdTeam lead = sdLead < 0 ? sdA : sdB;
+                foot = sdLeadGap >= 0f
+                    ? (lead.Tag + " ahead by " + sdLeadGap.ToString("0.000", CultureInfo.InvariantCulture))
+                    : (lead.Tag + " ahead on " + sdLeadMethod);
+                footCol = ReadableOn(lead.Col);
+            }
+            else if (sdFinA > 0 || sdFinB > 0) foot = "dead level";
+            else if (sdProjA >= 0f && sdProjB >= 0f)
+            {
+                float d = Mathf.Abs(sdProjA - sdProjB);
+                SdTeam fav = sdProjA < sdProjB ? sdA : sdB;
+                foot = "on GTR PBs: " + fav.Tag + " favoured by " + d.ToString("0.000", CultureInfo.InvariantCulture);
+            }
+            else foot = "waiting for times";
+            GUI.contentColor = footCol;
+            GUILayout.Label(foot, bestStyle);
+            GUI.contentColor = Color.white;
+
+            GUILayout.EndArea();
+        }
+
+        // The S6 broadcast form: both teams' averages ranked, with the gap on the trailing row. Falls
+        // back to the declared A/B order until both averages exist, so it never implies a lead it can't
+        // support.
+        private void SdCompactRows(Color ca, Color cb)
+        {
+            // Ranked by the real rule (finishers, then time), not by the displayed average.
+            bool aLeads = sdLead <= 0;
+            SdTeam t1 = aLeads ? sdA : sdB, t2 = aLeads ? sdB : sdA;
+            Color c1 = aLeads ? ca : cb, c2 = aLeads ? cb : ca;
+            float v1 = aLeads ? sdAvgA : sdAvgB, v2 = aLeads ? sdAvgB : sdAvgA;
+            int f1 = aLeads ? sdFinA : sdFinB, f2 = aLeads ? sdFinB : sdFinA;
+
+            SdCompactRow("#1", t1, c1, v1, f1, -1f);
+            SdCompactRow("#2", t2, c2, v2, f2, sdLead != 0 ? sdLeadGap : -1f);
+        }
+
+        private void SdCompactRow(string pos, SdTeam t, Color col, float avg, int fin, float gap)
+        {
+            GUILayout.BeginHorizontal(GUILayout.Height(Sc(26f)));
+            GUI.contentColor = dimColor;
+            GUILayout.Label(pos, sdSubStyle, GUILayout.Width(Sc(34f)));
+            GUI.contentColor = col;
+            GUILayout.Label(t.Tag, sdNameStyle, GUILayout.Width(Sc(96f)));
+            GUI.contentColor = avg >= 0f ? Color.white : dimColor;
+            GUILayout.Label(avg >= 0f ? avg.ToString("0.000", CultureInfo.InvariantCulture) : "--",
+                valueStyle, GUILayout.Width(Sc(100f)));
+            GUI.contentColor = gap > 0f ? elimColor : dimColor;
+            GUILayout.Label(gap > 0f ? ("+" + gap.ToString("0.000", CultureInfo.InvariantCulture)) : "",
+                valueStyle, GUILayout.Width(Sc(96f)));
+            // Only called out when someone is still missing - it decides the round, so it can't hide.
+            GUI.contentColor = fin < t.Players.Count ? bubbleColor : dimColor;
+            GUILayout.Label(fin + "/" + t.Players.Count, valueStyle, GUILayout.Width(Sc(52f)));
+            GUI.contentColor = Color.white;
+            GUILayout.FlexibleSpace();
+            GUILayout.EndHorizontal();
+        }
+
+        // One team: a row per racer, then the average line. Average is blank unless EVERY member has a
+        // time - the rules score a round on the team average and say nothing about a missing time, so
+        // the overlay refuses to invent a convention.
+        private void SdTeamBlock(SdTeam t, Color col, float avg)
+        {
+            foreach (SdPlayer p in t.Players)
+            {
+                float live = SdLiveTime(p);
+                float pb = -1f;
+                if (string.IsNullOrEmpty(p.SteamId) || !sdPb.TryGetValue(p.SteamId, out pb)) pb = -1f;
+
+                string timeStr = live >= 0f ? live.ToString("0.000", CultureInfo.InvariantCulture) : "--";
+                string dStr = "PB --";
+                Color dCol = dimColor;
+                if (live >= 0f && pb >= 0f)
+                {
+                    float d = live - pb;
+                    dStr = "PB " + (d >= 0f ? "+" : "-") + Mathf.Abs(d).ToString("0.00", CultureInfo.InvariantCulture);
+                    dCol = d < 0f ? goodColor : (d > 0f ? elimColor : dimColor);
+                }
+                else if (pb >= 0f) { dStr = "PB " + pb.ToString("0.000", CultureInfo.InvariantCulture); }
+
+                GUILayout.BeginHorizontal(GUILayout.Height(Sc(26f)));
+                GUI.contentColor = col;
+                GUILayout.Label(SdShortName(p), sdNameStyle, GUILayout.ExpandWidth(true));
+                GUI.contentColor = live >= 0f ? Color.white : dimColor;
+                GUILayout.Label(timeStr, valueStyle, GUILayout.Width(Sc(80f)));
+                GUI.contentColor = dCol;
+                GUILayout.Label(dStr, valueStyle, GUILayout.Width(Sc(96f)));
+                GUI.contentColor = Color.white;
+                GUILayout.EndHorizontal();
+            }
+
+            GUILayout.BeginHorizontal(GUILayout.Height(Sc(26f)));
+            GUILayout.FlexibleSpace();
+            GUI.contentColor = dimColor;
+            // Finisher count is shown because it OUTRANKS the time: a team ahead on average with one
+            // racer still out is losing the round, and that must not read as a lead.
+            int fin = SdFinishers(t);
+            GUILayout.Label(fin + "/" + t.Players.Count + " fin", sdSubStyle);
+            GUILayout.Space(Sc(8f));
+            GUI.contentColor = dimColor;
+            GUILayout.Label("avg", sdSubStyle);
+            GUI.contentColor = avg >= 0f ? col : dimColor;
+            GUILayout.Label(avg >= 0f ? avg.ToString("0.000", CultureInfo.InvariantCulture) : "--",
+                valueStyle, GUILayout.Width(Sc(80f)));
+            GUILayout.Space(Sc(96f));
+            GUI.contentColor = Color.white;
+            GUILayout.EndHorizontal();
+        }
+
+        // Prefer the racer's live lobby name (they may have renamed since the JSON was written).
+        private string SdShortName(SdPlayer p)
+        {
+            string n = LobbyNameForSid(p.SteamId);
+            if (string.IsNullOrEmpty(n)) n = p.Name;
+            if (string.IsNullOrEmpty(n)) n = "?";
+            return n.Length > 16 ? n.Substring(0, 15) + ".." : n;
+        }
+
+        private string SdMapLine()
+        {
+            string mapPart;
+            if (sdCurMap != null) mapPart = "#" + sdCurMap.N + " " + sdCurMap.Name;
+            else
+            {
+                string nm = CurrentLevelName();
+                mapPart = string.IsNullOrEmpty(nm) ? "off-pool map" : nm;
+            }
+            if (mapPart.Length > 22) mapPart = mapPart.Substring(0, 21) + "..";
+            string pick = sdPickerRandom ? " (random)"
+                        : (!string.IsNullOrEmpty(sdPickerTag) ? " (" + sdPickerTag + " pick)" : "");
+            return "R" + (sdPtsA + sdPtsB + 1) + " - " + mapPart + pick;
         }
 
         // Stats/Times bar buttons: set the click intent and re-apply to the current selection
@@ -1753,9 +3444,48 @@ namespace LobbyOverlay
         private void DrawGrips()
         {
             float hs = Sc(16f);
-            if (mode != Mode.None) GUI.Box(GripRect(cardDrawRect, hs), GUIContent.none, boxStyle);
-            GUI.Box(GripRect(panelRect, hs), GUIContent.none, boxStyle);
-            if (showPanel || mode != Mode.None) GUI.Box(GripRect(barRect, hs), GUIContent.none, boxStyle);
+            if (mode != Mode.None && castMode != CastMode.Showdown) DrawGrip(cardDrawRect, hs);
+            DrawGrip(panelRect, hs);
+            if (showPanel || mode != Mode.None) DrawGrip(barRect, hs);
+            if (castMode == CastMode.Showdown && sdRect.width > 0f) DrawGrip(sdRect, hs);
+            if (VsCamUp()) DrawResizeGrip(droneAppliedRect, hs); // VS cam: resize (not move - it's pinned)
+        }
+
+        // Resize grip in the VS cam's bottom-right corner: a faint square with a diagonal staircase of
+        // dots (the universal "drag to resize" glyph), brightening on hover. Distinct from the move
+        // grips so it reads as resize. Drag it to scale the PiP (see HandleDrag, draggingId 3).
+        private void DrawResizeGrip(Rect box, float hs)
+        {
+            Rect g = GripRect(box, hs);
+            GUI.Box(g, GUIContent.none, boxStyle);
+            Vector2 m = Event.current != null ? Event.current.mousePosition : new Vector2(-1f, -1f);
+            bool hover = GripRect(box, Sc(22f)).Contains(m);
+            Color prev = GUI.color;
+            GUI.color = hover ? accentCol : new Color(0.72f, 0.80f, 0.94f, 0.9f);
+            float d = Sc(2.5f), sp = Sc(4.5f);
+            for (int row = 0; row < 3; row++)            // 3-2-1 staircase toward the corner
+                for (int col = 0; col <= 2 - row; col++)
+                    GUI.DrawTexture(new Rect(g.xMax - d - col * sp, g.yMax - d - row * sp, d, d), whiteTex);
+            GUI.color = prev;
+        }
+
+        // A grip in the box's bottom-right corner. Always a faint square; when the mouse is over it
+        // (using the same enlarged hit area HandleDrag grabs) it lights up with an accent outline, so
+        // it reads as "grab here to move this window".
+        private void DrawGrip(Rect box, float hs)
+        {
+            Rect g = GripRect(box, hs);
+            GUI.Box(g, GUIContent.none, boxStyle);
+            Vector2 m = Event.current != null ? Event.current.mousePosition : new Vector2(-1f, -1f);
+            if (!GripRect(box, Sc(22f)).Contains(m)) return; // 22 = HandleDrag's hit size
+            Color prev = GUI.color;
+            GUI.color = accentCol;
+            float t = Sc(2f);
+            GUI.DrawTexture(new Rect(g.x, g.y, g.width, t), whiteTex);            // top
+            GUI.DrawTexture(new Rect(g.x, g.yMax - t, g.width, t), whiteTex);     // bottom
+            GUI.DrawTexture(new Rect(g.x, g.y, t, g.height), whiteTex);           // left
+            GUI.DrawTexture(new Rect(g.xMax - t, g.y, t, g.height), whiteTex);    // right
+            GUI.color = prev;
         }
 
         private Rect GripRect(Rect box, float hs)
@@ -1807,6 +3537,196 @@ namespace LobbyOverlay
             return list;
         }
 
+        // Fastest single time recorded across the whole current championship/cup: every completed
+        // round (playerRoundTimes) plus the in-progress round (roundTimes, not yet flushed). COTD
+        // only for now - it is the only comp we receive live per-round times for. false = no time yet.
+        private bool TryChampionshipBest(out string name, out string timeStr)
+        {
+            name = null; timeStr = null;
+            float best = -1f;
+            foreach (KeyValuePair<string, List<RoundTime>> kv in playerRoundTimes)
+            {
+                List<RoundTime> ts = kv.Value;
+                for (int i = 0; i < ts.Count; i++)
+                {
+                    float t = ParseTime(ts[i].Time);
+                    if (t >= 0f && (best < 0f || t < best)) { best = t; name = kv.Key; timeStr = ts[i].Time; }
+                }
+            }
+            foreach (KeyValuePair<string, string> kv in roundTimes)
+            {
+                float t = ParseTime(kv.Value);
+                if (t >= 0f && (best < 0f || t < best)) { best = t; name = kv.Key; timeStr = kv.Value; }
+            }
+            return best >= 0f;
+        }
+
+        // Cup best scoped to one map (for alternating multi-map cups). Only counts stored times tagged
+        // with this uid (untagged legacy times still count); the in-progress round counts only when it
+        // belongs to this map. Falls back to the global best when no uid is known.
+        private bool TryChampionshipBestForMap(string uid, out string name, out string timeStr)
+        {
+            name = null; timeStr = null;
+            if (string.IsNullOrEmpty(uid)) return TryChampionshipBest(out name, out timeStr);
+            float best = -1f;
+            foreach (KeyValuePair<string, List<RoundTime>> kv in playerRoundTimes)
+            {
+                List<RoundTime> ts = kv.Value;
+                for (int i = 0; i < ts.Count; i++)
+                {
+                    if (ts[i].Uid != null && ts[i].Uid != uid) continue; // skip the other map
+                    float t = ParseTime(ts[i].Time);
+                    if (t >= 0f && (best < 0f || t < best)) { best = t; name = kv.Key; timeStr = ts[i].Time; }
+                }
+            }
+            if (curRoundMapUid == null || curRoundMapUid == uid)
+            {
+                foreach (KeyValuePair<string, string> kv in roundTimes)
+                {
+                    float t = ParseTime(kv.Value);
+                    if (t >= 0f && (best < 0f || t < best)) { best = t; name = kv.Key; timeStr = kv.Value; }
+                }
+            }
+            return best >= 0f;
+        }
+
+        // ---------------- GTR world record for the current map (graphql.zeepki.st) ----------------
+
+        // Current online level's UID (the GTR level hash), or null when not in a lobby/level.
+        private string CurrentLevelUid()
+        {
+            try
+            {
+                ZeepkistLobby lobby = ZeepkistNetwork.CurrentLobby;
+                if (lobby == null) return null;
+                return string.IsNullOrEmpty(lobby.LevelUID) ? null : lobby.LevelUID;
+            }
+            catch { return null; }
+        }
+
+        // Human-readable name of the currently loaded level (e.g. "PCDJ #30 - Horncrawl"), or null.
+        // Local + in-process via ZeepSDK (no network) - same source the TopoutTracker mod uses.
+        private string CurrentLevelName()
+        {
+            try
+            {
+                var lvl = LevelApi.CurrentLevel;
+                return lvl != null ? lvl.Name : null;
+            }
+            catch { return null; }
+        }
+
+        // GTR level hash of the currently loaded level (the uppercase SHA-1 graphql.zeepki.st keys on).
+        // IMPORTANT: CurrentLobby.LevelUID is "<code>_<author>", NOT the GTR hash - using it for WR
+        // lookups always missed (levels.nodes = []). LevelApi.CurrentHash is the real hash.
+        private string CurrentLevelHash()
+        {
+            try
+            {
+                string h = LevelApi.CurrentHash;
+                return string.IsNullOrEmpty(h) ? null : h;
+            }
+            catch { return null; }
+        }
+
+        // Kick off a WR fetch when the current level changes (once per level, on a bg thread). Called
+        // from the poll ONLY while the overlay bar/cards are up (so we never fetch for a racer or touch
+        // round start). One request per level per session; a failure shows "WR: -" until the level changes.
+        private void MaybeFetchWr()
+        {
+            if (wrFetching) return;
+            string uid = CurrentLevelHash(); // the GTR hash, NOT LevelUID (which is "<code>_<author>")
+            if (string.IsNullOrEmpty(uid)) return;
+            if (uid == wrUid) return; // already have it (or already tried) for this level
+            StartWrFetch(uid);
+        }
+
+        private void StartWrFetch(string uid)
+        {
+            wrFetching = true;
+            wrUid = uid;                  // claim now so the poll doesn't re-fire; result commits via wrPending
+            wrHolder = ""; wrTime = "";   // drop the previous map's WR immediately
+            Logger.LogInfo("[wr] fetch start for hash " + uid);
+            System.Threading.Thread t = new System.Threading.Thread(delegate ()
+            {
+                string holder = "", time = "";
+                try { FetchWrBlocking(uid, out holder, out time); }
+                catch { holder = ""; time = ""; }
+                wrPendingHolder = holder; wrPendingTime = time; wrPendingUid = uid; wrPending = true;
+            });
+            t.IsBackground = true;
+            try { t.Start(); }
+            catch { wrFetching = false; }
+        }
+
+        // One nested GraphQL query: level by hash -> its single fastest record (holder + time). The
+        // hash is uppercased to match GTR's stored form. Any miss/error leaves holder/time empty.
+        private void FetchWrBlocking(string uid, out string holder, out string time)
+        {
+            holder = ""; time = "";
+            string hash = uid.ToUpperInvariant();
+            if (TryWr(hash, out holder, out time)) return;
+            // Adjusted/versioned levels carry a "-N" suffix on the hash; GTR may key the base hash.
+            int dash = hash.LastIndexOf('-');
+            if (dash > 0 && dash < hash.Length - 1)
+            {
+                bool allDigits = true;
+                for (int i = dash + 1; i < hash.Length; i++) if (!char.IsDigit(hash[i])) { allDigits = false; break; }
+                if (allDigits && TryWr(hash.Substring(0, dash), out holder, out time)) return;
+            }
+            Logger.LogInfo("[wr] no record for hash " + hash);
+        }
+
+        // Query GTR for one level's fastest record. Returns true (with holder/time) if the level and a
+        // record were found; false on network error or no match. Assumes hashUpper is already uppercase.
+        private bool TryWr(string hashUpper, out string holder, out string time)
+        {
+            holder = ""; time = "";
+            string esc = hashUpper.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            string r = GqlPost("{levels(filter:{hash:{equalTo:\"" + esc +
+                "\"}}){nodes{records(orderBy:TIME_ASC,first:1){nodes{time user{steamName}}}}}}");
+            if (r == null) { Logger.LogWarning("[wr] GTR request failed/timed out for " + hashUpper); return false; }
+            JToken rec = JObject.Parse(r).SelectToken("data.levels.nodes[0].records.nodes[0]");
+            if (rec == null) return false;
+            JToken tTok = rec["time"];
+            JToken nameTok = rec.SelectToken("user.steamName");
+            if (tTok != null) time = FmtClockSec((double)tTok);
+            holder = nameTok != null ? (string)nameTok : "";
+            Logger.LogInfo(string.Format("[wr] {0} -> {1} {2}", hashUpper, holder, time));
+            return true;
+        }
+
+        // POST a GraphQL query to GTR with a short timeout (a Spanish-ISP block must not hang the bg
+        // thread on the default 100 s). Returns the raw JSON body, or null on any error.
+        private string GqlPost(string query)
+        {
+            try
+            {
+                string body = "{\"query\":" + Newtonsoft.Json.JsonConvert.ToString(query) + "}";
+                byte[] data = System.Text.Encoding.UTF8.GetBytes(body);
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create("https://graphql.zeepki.st");
+                req.Method = "POST";
+                req.ContentType = "application/json";
+                req.UserAgent = "TournamentCastingUI/1.0 (+zeepkist casting mod)";
+                req.Timeout = 8000;
+                req.ReadWriteTimeout = 8000;
+                req.ContentLength = data.Length;
+                using (Stream rs = req.GetRequestStream()) rs.Write(data, 0, data.Length);
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                using (StreamReader sr = new StreamReader(resp.GetResponseStream(), System.Text.Encoding.UTF8))
+                    return sr.ReadToEnd();
+            }
+            catch { return null; }
+        }
+
+        private static string FmtClockSec(double seconds)
+        {
+            if (seconds < 0.0) return "";
+            int mins = (int)(seconds / 60.0);
+            double secs = seconds - mins * 60;
+            return string.Format(CultureInfo.InvariantCulture, "{0}:{1:00.000}", mins, secs);
+        }
+
         private void DrawRoundWinsCard(float x, float y, float w)
         {
             List<KeyValuePair<string, int>> wins = ComputeRoundWins();
@@ -1840,7 +3760,10 @@ namespace LobbyOverlay
 
             if (e.type == EventType.MouseDown && e.button == 0)
             {
-                if (mode != Mode.None && GripRect(cardDrawRect, hs).Contains(e.mousePosition))
+                // No stat card is drawn in Showdown, and cardDrawRect aliases the score box there, so the
+                // card branch must stand down or it would hijack the score box's own grip (id 4).
+                if (mode != Mode.None && castMode != CastMode.Showdown &&
+                    GripRect(cardDrawRect, hs).Contains(e.mousePosition))
                 {
                     draggingId = 0;
                     dragOffset = new Vector2(e.mousePosition.x - cardRect.x, e.mousePosition.y - cardRect.y);
@@ -1858,12 +3781,26 @@ namespace LobbyOverlay
                     dragOffset = new Vector2(e.mousePosition.x - barRect.x, e.mousePosition.y - barRect.y);
                     e.Use();
                 }
+                else if (castMode == CastMode.Showdown && sdRect.width > 0f &&
+                         GripRect(sdRect, hs).Contains(e.mousePosition))
+                {
+                    draggingId = 4;
+                    dragOffset = new Vector2(e.mousePosition.x - sdRect.x, e.mousePosition.y - sdRect.y);
+                    e.Use();
+                }
+                else if (VsCamUp() && GripRect(droneAppliedRect, hs).Contains(e.mousePosition))
+                {
+                    draggingId = 3; // VS cam resize (no offset: scale is derived from the mouse directly)
+                    e.Use();
+                }
             }
             else if (e.type == EventType.MouseDrag && draggingId >= 0)
             {
                 if (draggingId == 0) { cardRect.x = e.mousePosition.x - dragOffset.x; cardRect.y = e.mousePosition.y - dragOffset.y; }
                 else if (draggingId == 1) { panelRect.x = e.mousePosition.x - dragOffset.x; panelRect.y = e.mousePosition.y - dragOffset.y; }
-                else { barRect.x = e.mousePosition.x - dragOffset.x; barRect.y = e.mousePosition.y - dragOffset.y; }
+                else if (draggingId == 2) { barRect.x = e.mousePosition.x - dragOffset.x; barRect.y = e.mousePosition.y - dragOffset.y; }
+                else if (draggingId == 4) { sdRect.x = e.mousePosition.x - dragOffset.x; sdRect.y = e.mousePosition.y - dragOffset.y; }
+                else { ResizeVsCam(e.mousePosition); }
                 e.Use();
             }
             else if (e.type == EventType.MouseUp && draggingId >= 0)
@@ -1872,6 +3809,18 @@ namespace LobbyOverlay
                 SaveLayout();
                 e.Use();
             }
+        }
+
+        // Live VS cam resize: the dragged corner sets the width, which drives a uniform scale (the
+        // card's aspect is preserved), clamped so the window can't vanish or balloon. Applied right
+        // away so the feed and its chrome track the drag; persisted on mouse-up by SaveLayout.
+        private void ResizeVsCam(Vector2 mouse)
+        {
+            if (cardDrawRect.width < 1f) return;
+            float newW = mouse.x - cardDrawRect.x; // left edge is pinned to the card
+            droneScale = Mathf.Clamp(newW / cardDrawRect.width, 0.35f, 2f);
+            Rect nr = DroneWantRect();
+            if (droneRef != null && ApplyDroneRect(droneRef, nr)) droneAppliedRect = nr;
         }
 
         // Persisted overlay layout (window positions + a few sticky panel choices). Property defaults
@@ -1889,12 +3838,17 @@ namespace LobbyOverlay
             public string comp { get; set; }
             public bool cam { get; set; }
             public string castmode { get; set; }
+            public float vscamScale { get; set; }
+            public float sdX { get; set; }
+            public float sdY { get; set; }
             public LayoutData()
             {
                 cardX = 24f; cardY = 130f;
                 panelX = -1f; panelY = 130f;
                 barX = -1f; barY = 0f;
                 comp = "cotd"; cam = true; castmode = "cup";
+                vscamScale = 1f;
+                sdX = -1f; sdY = 0f;
             }
         }
 
@@ -1928,10 +3882,14 @@ namespace LobbyOverlay
             cardRect.x = d.cardX; cardRect.y = d.cardY;
             panelRect.x = d.panelX; panelRect.y = d.panelY;
             barRect.x = d.barX; barRect.y = d.barY;
+            sdRect.x = d.sdX; sdRect.y = d.sdY;
             if (!string.IsNullOrEmpty(d.comp)) selectedComp = d.comp;
             camLink = d.cam;
             string cm = (d.castmode ?? "cup").ToLowerInvariant();
-            castMode = cm == "topout" ? CastMode.Topout : (cm == "pursuit" ? CastMode.Pursuit : CastMode.Cup);
+            castMode = cm == "topout" ? CastMode.Topout
+                     : (cm == "pursuit" ? CastMode.Pursuit
+                     : (cm == "showdown" ? CastMode.Showdown : CastMode.Cup));
+            droneScale = d.vscamScale > 0f ? Mathf.Clamp(d.vscamScale, 0.35f, 2f) : 1f;
             if (!availableComps.Contains(selectedComp)) selectedComp = "cotd";
         }
 
@@ -1944,7 +3902,9 @@ namespace LobbyOverlay
                 d.cardX = cardRect.x; d.cardY = cardRect.y;
                 d.panelX = panelRect.x; d.panelY = panelRect.y;
                 d.barX = barRect.x; d.barY = barRect.y;
+                d.sdX = sdRect.x; d.sdY = sdRect.y;
                 d.comp = selectedComp; d.cam = camLink; d.castmode = CastLabel(castMode).ToLowerInvariant();
+                d.vscamScale = droneScale;
                 Storage.SaveToJson(LayoutFile, d);
             }
             catch { }
@@ -1958,6 +3918,7 @@ namespace LobbyOverlay
             cardRect.x = 24f; cardRect.y = 130f;   // card: top-left
             panelRect.x = -1f; panelRect.y = 130f; // panel: x<0 -> right side
             barRect.x = -1f; barRect.y = 0f;       // mode bar: x<0 -> bottom-left
+            droneScale = 1f;                       // VS cam back to card size
             SaveLayout();
         }
 
@@ -2015,16 +3976,21 @@ namespace LobbyOverlay
                 ClearAll();
             GUILayout.EndHorizontal();
 
-            // [Stats] = which comp's numbers the cards + H2H show. [Comp] = which cup format
-            // orders the player list below. Left-click cycles forward, right-click back. Persisted.
-            GUILayout.BeginHorizontal();
-            int sd = CycleButton("Stats: " + CompLabel(selectedComp) + " ◂▸");
-            if (sd != 0) CycleComp(sd);
-            GUILayout.EndHorizontal();
+            // [Comp] = which cup format orders the player list below; it comes FIRST because it's the
+            // setting a caster picks once at the start. [Stats] = which comp's numbers the cards show,
+            // and it's hidden in Showdown, which shows no comp stats at all.
+            // Left-click cycles forward, right-click back. Persisted.
             GUILayout.BeginHorizontal();
             int md = CycleButton("Comp: " + CastLabel(castMode) + " ◂▸");
             if (md != 0) CycleCast(md);
             GUILayout.EndHorizontal();
+            if (castMode != CastMode.Showdown)
+            {
+                GUILayout.BeginHorizontal();
+                int sd = CycleButton("Stats: " + CompLabel(selectedComp) + " ◂▸");
+                if (sd != 0) CycleComp(sd);
+                GUILayout.EndHorizontal();
+            }
             // Bind the Stats card to the photomode follow-camera (click a player below to also
             // steer the camera; with nothing selected the card tracks whoever you're following).
             GUILayout.BeginHorizontal();
@@ -2041,12 +4007,17 @@ namespace LobbyOverlay
                 { droneOn = !droneOn; DroneLog("toggle: " + (droneOn ? "on" : "off")); EnsureDrone(); }
                 GUILayout.EndHorizontal();
             }
+            if (castMode == CastMode.Showdown) DrawShowdownControls();
             GUILayout.Space(Sc(4f));
 
             panelScroll = GUILayout.BeginScrollView(panelScroll);
             try
             {
-                List<PRow> rows = BuildPanelRows();
+                // Cached by the 5 Hz Update poll; only built here on the very first frame the panel
+                // opens (and then cached, so Layout and Repaint in the same frame agree - GUILayout
+                // requires the row count to match across passes).
+                List<PRow> rows = panelRowsCache;
+                if (rows == null) { rows = BuildPanelRows(); panelRowsCache = rows; }
                 foreach (PRow r in rows)
                 {
                     bool sel = IsSelected(r.Sid);
@@ -2061,6 +4032,83 @@ namespace LobbyOverlay
             catch { }
             GUILayout.EndScrollView();
             GUILayout.EndArea();
+        }
+
+        // Every live Showdown correction as a BUTTON. Zeepkist has no clipboard, so anything that would
+        // need a name typed into chat is unusable mid-cast: click a player in the list below, then click
+        // the team to move them to.
+        private void DrawShowdownControls()
+        {
+            GUILayout.Space(Sc(4f));
+            if (sdA == null || sdB == null)
+            {
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button(sdDebugTeams ? "Debug teams: On" : "Debug teams: Off", buttonStyle))
+                    SdToggleDebugTeams();
+                GUILayout.EndHorizontal();
+                return;
+            }
+
+            // Score: click a team to give it a point, right-click to take one back.
+            GUILayout.BeginHorizontal();
+            int ca = LeftRightClick("+1 " + sdA.Tag, buttonStyle);
+            if (ca == 1) sdPtsA++; else if (ca == 2 && sdPtsA > 0) sdPtsA--;
+            int cb = LeftRightClick("+1 " + sdB.Tag, buttonStyle);
+            if (cb == 1) sdPtsB++; else if (cb == 2 && sdPtsB > 0) sdPtsB--;
+            GUILayout.EndHorizontal();
+
+            // Who picked the map currently up: cycles A -> B -> random -> unset.
+            GUILayout.BeginHorizontal();
+            string pickLbl = sdPickerRandom ? "random"
+                           : (string.IsNullOrEmpty(sdPickerTag) ? "-" : sdPickerTag);
+            if (GUILayout.Button("Pick: " + pickLbl + " ▸", buttonStyle)) SdCyclePicker();
+            GUILayout.EndHorizontal();
+
+            // Move the selected player between teams (covers a late substitute with zero typing).
+            if (selected.Count == 1)
+            {
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button("→ " + sdA.Tag, buttonStyle)) SdMoveSid(selected[0].Sid, sdA);
+                if (GUILayout.Button("→ " + sdB.Tag, buttonStyle)) SdMoveSid(selected[0].Sid, sdB);
+                GUILayout.EndHorizontal();
+            }
+
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("New match", buttonStyle))
+            {
+                sdPtsA = 0; sdPtsB = 0; sdScored.Clear(); sdPickerTag = null; sdPickerRandom = false;
+            }
+            if (GUILayout.Button(sdMatchupForced ? "Auto teams" : "Swap sides", buttonStyle))
+            {
+                if (sdMatchupForced) { sdMatchupForced = false; sdRosterSig = null; SdDetectMatchup(true); }
+                else { SdTeam t = sdA; sdA = sdB; sdB = t; int p = sdPtsA; sdPtsA = sdPtsB; sdPtsB = p; }
+            }
+            GUILayout.EndHorizontal();
+
+            // "Show all": a PhotoDrone per racer in a 2x2. Slots with no racer are simply not created,
+            // so a 3-player lobby shows 3 feeds and a 2-player one shows 2.
+            if (DroneApiReady())
+            {
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button(sdQuadOn ? "4x cam: On" : "4x cam: Off",
+                                     sdQuadOn ? buttonSelStyle : buttonStyle))
+                    SdToggleQuad();
+                GUILayout.EndHorizontal();
+            }
+
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button(sdDebugTeams ? "Debug teams: On" : "Debug teams: Off",
+                                 sdDebugTeams ? buttonSelStyle : buttonStyle))
+                SdToggleDebugTeams();
+            GUILayout.EndHorizontal();
+        }
+
+        private void SdCyclePicker()
+        {
+            if (sdPickerRandom) { sdPickerRandom = false; sdPickerTag = null; }
+            else if (string.IsNullOrEmpty(sdPickerTag)) sdPickerTag = sdA != null ? sdA.Tag : null;
+            else if (sdA != null && sdPickerTag == sdA.Tag) sdPickerTag = sdB != null ? sdB.Tag : null;
+            else { sdPickerTag = null; sdPickerRandom = true; }
         }
 
         private enum PStatus { NoTime, Bubble, Safe, Out, NonRacer, Win, LastLife }
@@ -2096,7 +4144,57 @@ namespace LobbyOverlay
             if (list == null) return new List<PRow>();
             if (castMode == CastMode.Topout) return BuildTopoutRows(list);
             if (castMode == CastMode.Pursuit) return BuildPursuitRows(list);
+            if (castMode == CastMode.Showdown) return BuildShowdownRows(list);
             return BuildCupRows(list);
+        }
+
+        // Showdown click-list: the four racers grouped by team (team A first, then team B), then anyone
+        // else in the lobby (casters, spectators, an unregistered substitute) greyed at the bottom so
+        // they can still be followed. Red = no time yet this round, white = timed.
+        private List<PRow> BuildShowdownRows(List<ZeepkistNetworkPlayer> list)
+        {
+            List<PRow> rows = new List<PRow>();
+            List<PRow> others = new List<PRow>();
+            Dictionary<string, ZeepkistNetworkPlayer> byId = new Dictionary<string, ZeepkistNetworkPlayer>();
+            foreach (ZeepkistNetworkPlayer p in list)
+                byId[p.SteamID.ToString(CultureInfo.InvariantCulture)] = p;
+
+            HashSet<string> placed = new HashSet<string>();
+            for (int side = 0; side < 2; side++)
+            {
+                SdTeam t = side == 0 ? sdA : sdB;
+                if (t == null) continue;
+                foreach (SdPlayer sp in t.Players)
+                {
+                    if (string.IsNullOrEmpty(sp.SteamId)) continue;
+                    placed.Add(sp.SteamId);
+                    ZeepkistNetworkPlayer p;
+                    bool present = byId.TryGetValue(sp.SteamId, out p);
+                    PRow r = new PRow();
+                    r.Sid = sp.SteamId;
+                    r.Name = present ? SafeName(p) : sp.Name;
+                    if (string.IsNullOrEmpty(r.Name)) r.Name = sp.Name != null ? sp.Name : "?";
+                    r.Name = t.Tag + " " + r.Name;
+                    float tm = SdLiveTime(sp);
+                    r.HasTime = tm >= 0f;
+                    r.InBoard = present;
+                    r.T = tm;
+                    r.Status = !present ? PStatus.Out : (r.HasTime ? PStatus.Safe : PStatus.NoTime);
+                    rows.Add(r);
+                }
+            }
+            foreach (ZeepkistNetworkPlayer p in list)
+            {
+                string sid = p.SteamID.ToString(CultureInfo.InvariantCulture);
+                if (placed.Contains(sid)) continue;
+                PRow r = new PRow();
+                r.Sid = sid;
+                r.Name = SafeName(p); if (r.Name == null) r.Name = "?";
+                r.Status = PStatus.NonRacer;
+                others.Add(r);
+            }
+            rows.AddRange(others);
+            return rows;
         }
 
         // Once the finals start taking shape - a winner is crowned, or this many finalists are
@@ -2316,6 +4414,7 @@ namespace LobbyOverlay
         // ---- Topout native data (custom-leaderboard override text + championship points) ----
         private bool toChecked;
         private MethodInfo toGetOverrideMI;  // ZeepkistNetwork.GetLeaderboardOverride(ulong)
+        private FieldInfo[] toOverrideStrFIs;// every string field on that override struct
         private FieldInfo toOverrideTextFI;  // LeaderboardOverrideItem.overridePositionText
         private FieldInfo toChampFI;         // ZeepkistNetworkPlayer/PlayerBase.ChampionshipPoints
 
@@ -2328,7 +4427,17 @@ namespace LobbyOverlay
                 Type zn = typeof(ZeepkistNetwork);
                 toGetOverrideMI = zn.GetMethod("GetLeaderboardOverride", new Type[] { typeof(ulong) });
                 if (toGetOverrideMI != null && toGetOverrideMI.ReturnType != null)
+                {
                     toOverrideTextFI = toGetOverrideMI.ReturnType.GetField("overridePositionText");
+                    // Every string field on the override struct, so the Showdown team colour can be
+                    // found without hardcoding a field name we can't verify from here.
+                    List<FieldInfo> strs = new List<FieldInfo>();
+                    FieldInfo[] all = toGetOverrideMI.ReturnType.GetFields(
+                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    for (int i = 0; i < all.Length; i++)
+                        if (all[i].FieldType == typeof(string)) strs.Add(all[i]);
+                    toOverrideStrFIs = strs.ToArray();
+                }
                 Type t = typeof(ZeepkistNetworkPlayer);
                 while (t != null && toChampFI == null)
                 {
@@ -2488,31 +4597,176 @@ namespace LobbyOverlay
             });
         }
 
+        // ---- Multi-map grouping for the Times view: split a player's rounds by the map raced on ----
+        private static string MapKey(string uid) { return uid == null ? "" : uid; }
+
+        // Distinct map keys present across the given players' times, ordered by first-seen (mapOrder);
+        // any key not in mapOrder (e.g. the null-uid bucket) is appended last.
+        private List<string> OrderedMapKeys(List<RoundTime> a, List<RoundTime> b)
+        {
+            HashSet<string> present = new HashSet<string>();
+            CollectMapKeys(present, a);
+            CollectMapKeys(present, b);
+            List<string> ordered = new List<string>();
+            for (int i = 0; i < mapOrder.Count; i++)
+                if (present.Remove(mapOrder[i])) ordered.Add(mapOrder[i]);
+            foreach (string k in present) ordered.Add(k);
+            return ordered;
+        }
+        private static void CollectMapKeys(HashSet<string> set, List<RoundTime> list)
+        {
+            if (list == null) return;
+            for (int i = 0; i < list.Count; i++) set.Add(MapKey(list[i].Uid));
+        }
+        // Sorted round numbers in this player's list that belong to the given map key.
+        private static void CollectRounds(SortedDictionary<int, bool> set, List<RoundTime> list, string mapKey)
+        {
+            if (list == null) return;
+            for (int i = 0; i < list.Count; i++)
+                if (MapKey(list[i].Uid) == mapKey) set[list[i].Round] = true;
+        }
+        // Display name for a map key (its real level name, or "Map" when unknown/untagged).
+        private string MapLabel(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return "Map";
+            string nm;
+            if (mapNames.TryGetValue(key, out nm) && !string.IsNullOrEmpty(nm)) return nm;
+            return "Map";
+        }
+
         private void DrawTimesCard(float x, float y, float w, string name)
         {
             List<RoundTime> times;
             playerRoundTimes.TryGetValue(name, out times);
-            int rows = times != null ? times.Count : 0;
-            float h = Sc(64f) + rows * Sc(28f) + (rows == 0 ? Sc(28f) : 0f);
+
+            // Group this player's rounds by map (each map a subheader), so an alternating cup shows a
+            // player's per-map progression (R1, R3, R5) together instead of interleaved with the other map.
+            List<string> maps = OrderedMapKeys(times, null);
+            Dictionary<string, List<int>> byMap = new Dictionary<string, List<int>>();
+            int totalRows = 0;
+            for (int mi = 0; mi < maps.Count; mi++)
+            {
+                SortedDictionary<int, bool> set = new SortedDictionary<int, bool>();
+                CollectRounds(set, times, maps[mi]);
+                List<int> rl = new List<int>(set.Keys);
+                byMap[maps[mi]] = rl;
+                totalRows += rl.Count;
+            }
+
+            float h = Sc(64f);
+            if (totalRows == 0) h += Sc(28f);
+            else for (int mi = 0; mi < maps.Count; mi++) h += Sc(24f) + byMap[maps[mi]].Count * Sc(28f);
 
             cardDrawRect = new Rect(x, y, w, h);
             GUILayout.BeginArea(new Rect(x, y, w, h), boxStyle);
-            GUILayout.Label(name, pnameStyle); // player name: site default white (live name,
-                                               // no pool lookup here)
-            if (rows == 0)
+            GUILayout.Label(name, pnameStyle); // player name: site default white (live name, no pool lookup)
+            if (totalRows == 0)
             {
                 GUILayout.Label("no times yet", labelStyle);
             }
             else
             {
-                for (int i = times.Count - 1; i >= 0; i--) // newest round first
+                for (int mi = 0; mi < maps.Count; mi++)
                 {
-                    string t = times[i].Time;
-                    if (t != null) t = t.Replace(',', '.'); // logged with comma decimals
-                    Row("Round " + times[i].Round, t);
+                    List<int> rl = byMap[maps[mi]];
+                    if (rl.Count == 0) continue;
+                    GUI.contentColor = accentCol;
+                    GUILayout.Label(MapLabel(maps[mi]), centerStyle); // map divider
+                    GUI.contentColor = Color.white;
+                    for (int i = rl.Count - 1; i >= 0; i--) // newest round first
+                    {
+                        string t = TimeForRound(times, rl[i]);
+                        if (t != null) t = t.Replace(',', '.'); // logged with comma decimals
+                        Row("R" + rl[i], t);
+                    }
                 }
             }
             GUILayout.EndArea();
+        }
+
+        // Two-player TIMES comparison (the Times toggle with two selected): each round's time side by
+        // side, faster highlighted. Same header/colours as DrawH2H but lists live per-round times.
+        private void DrawTimesH2H(float x, float y, float w, Stat a, Stat b)
+        {
+            List<RoundTime> ta = RoundTimesFor(a);
+            List<RoundTime> tb = RoundTimesFor(b);
+
+            // Group rounds by map (each a subheader), union of both players per map. Rows keep their real
+            // round number, so a map's rows read R1, R3, R5 in an alternating cup - still like-for-like
+            // (everyone races the same map each round), just no longer interleaved with the other map.
+            List<string> maps = OrderedMapKeys(ta, tb);
+            Dictionary<string, List<int>> byMap = new Dictionary<string, List<int>>();
+            int totalRows = 0;
+            for (int mi = 0; mi < maps.Count; mi++)
+            {
+                SortedDictionary<int, bool> set = new SortedDictionary<int, bool>();
+                CollectRounds(set, ta, maps[mi]);
+                CollectRounds(set, tb, maps[mi]);
+                List<int> rl = new List<int>(set.Keys);
+                byMap[maps[mi]] = rl;
+                totalRows += rl.Count;
+            }
+
+            float h = Sc(64f);
+            if (totalRows == 0) h += Sc(28f);
+            else for (int mi = 0; mi < maps.Count; mi++) h += Sc(24f) + byMap[maps[mi]].Count * Sc(28f);
+
+            cardDrawRect = new Rect(x, y, w, h);
+            GUILayout.BeginArea(new Rect(x, y, w, h), boxStyle);
+            GUILayout.BeginHorizontal();
+            GUI.contentColor = NameColor(a);
+            GUILayout.Label(a.Name, nameLeftStyle, GUILayout.Width(Sc(170f)));
+            GUILayout.FlexibleSpace();
+            GUI.contentColor = NameColor(b);
+            GUILayout.Label(b.Name, nameRightStyle, GUILayout.Width(Sc(170f)));
+            GUI.contentColor = Color.white;
+            GUILayout.EndHorizontal();
+            AccentLine(LineColor(a), LineColor(b));
+            if (totalRows == 0) { GUILayout.Label("no times yet", labelStyle); GUILayout.EndArea(); return; }
+
+            for (int mi = 0; mi < maps.Count; mi++)
+            {
+                List<int> rl = byMap[maps[mi]];
+                if (rl.Count == 0) continue;
+                GUI.contentColor = accentCol;
+                GUILayout.Label(MapLabel(maps[mi]), centerStyle); // map divider
+                GUI.contentColor = Color.white;
+                for (int i = rl.Count - 1; i >= 0; i--) // newest round first
+                {
+                    int rd = rl[i];
+                    string sa = TimeForRound(ta, rd);
+                    string sb = TimeForRound(tb, rd);
+                    float fa = ParseTime(sa);
+                    float fb = ParseTime(sb);
+                    int better = 0;
+                    if (fa >= 0f && fb >= 0f) better = fa < fb ? 1 : (fb < fa ? 2 : 0);
+                    else if (fa >= 0f) better = 1;
+                    else if (fb >= 0f) better = 2;
+                    CompRow(sa != null ? sa.Replace(',', '.') : "-", "R" + rd,
+                            sb != null ? sb.Replace(',', '.') : "-", better);
+                }
+            }
+            GUILayout.EndArea();
+        }
+
+        private static string TimeForRound(List<RoundTime> list, int round)
+        {
+            if (list == null) return null;
+            for (int i = 0; i < list.Count; i++) if (list[i].Round == round) return list[i].Time;
+            return null;
+        }
+
+        // Kerki is topout: it has no podium, so its second headline stat is FINALIST appearances
+        // (reached the final). The pool builder maps only w1-w5/f finishes into the finish history and
+        // drops "o" (out before the final), so the size of that history IS the finalist count. Other
+        // comps keep podiums (top 3). ("Wins" for Kerki is the pool's top-5 count, left as-is.)
+        private bool CompUsesFinalists(string comp) { return comp == "kerki"; }
+        private string SecondStatLabel(string comp) { return CompUsesFinalists(comp) ? "finalists" : "podiums"; }
+        private int SecondStatValue(CompStat c)
+        {
+            if (c == null) return 0;
+            if (CompUsesFinalists(selectedComp)) return c.Hist != null ? c.Hist.Count : 0;
+            return c.Podiums;
         }
 
         private void DrawCard(Rect r, Stat s)
@@ -2534,7 +4788,7 @@ namespace LobbyOverlay
             GUILayout.Label(CompLabel(selectedComp) + " record", centerStyle);
             CompStat c = CompFor(s, selectedComp);
             Row("Wins", c != null ? c.Wins.ToString() : "-");
-            Row("Podiums", c != null ? c.Podiums.ToString() : "-");
+            Row(CompUsesFinalists(selectedComp) ? "Finalists" : "Podiums", c != null ? SecondStatValue(c).ToString() : "-");
             Row("Cups", c != null ? c.Cups.ToString() : "-");
             Row("Best finish", (c != null && c.Best > 0) ? ("#" + c.Best) : "-");
             GUILayout.EndArea();
@@ -2596,8 +4850,8 @@ namespace LobbyOverlay
             AccentLine(LineColor(a), LineColor(b)); // each half in that player's COTD colour
 
             // fastest time in the cup (lower better); slower side shows the gap
-            string lapA = FastestInCup(a.Name);
-            string lapB = FastestInCup(b.Name);
+            string lapA = FastestInCup(a);
+            string lapB = FastestInCup(b);
             string dispA = FmtLap(lapA);
             string dispB = FmtLap(lapB);
             float fa = ParseTime(lapA);
@@ -2607,7 +4861,7 @@ namespace LobbyOverlay
                 string gap = FmtGap(Math.Abs(fa - fb));
                 if (fa > fb) dispA = dispA + "  " + gap; else dispB = dispB + "  " + gap;
             }
-            CompRow(dispA, "fastest in cup", dispB, BetterTime(lapA, lapB));
+            CompRow(dispA, "fastest lap", dispB, BetterTime(lapA, lapB));
 
             // mutual record (more wins better) from the chosen h2h source; center shows total shared
             int w1, w2;
@@ -2624,10 +4878,10 @@ namespace LobbyOverlay
             CompStat ca = CompFor(a, selectedComp);
             CompStat cb = CompFor(b, selectedComp);
             int aw = ca != null ? ca.Wins : 0, bw = cb != null ? cb.Wins : 0;
-            int ap = ca != null ? ca.Podiums : 0, bp = cb != null ? cb.Podiums : 0;
+            int ap = SecondStatValue(ca), bp = SecondStatValue(cb);
             int ab = ca != null ? ca.Best : 0, bb = cb != null ? cb.Best : 0;
             CompRow(aw.ToString(), CompLabel(selectedComp) + " wins", bw.ToString(), Better(aw, bw, true));
-            CompRow(ap.ToString(), "podiums", bp.ToString(), Better(ap, bp, true));
+            CompRow(ap.ToString(), SecondStatLabel(selectedComp), bp.ToString(), Better(ap, bp, true));
             CompRow(Pb(ab), "pb", Pb(bb), BetterPb(ab, bb));
 
             GUILayout.EndArea();
@@ -2686,6 +4940,16 @@ namespace LobbyOverlay
         {
             if (string.IsNullOrEmpty(t)) return "-";
             return t.Replace(',', '.');
+        }
+
+        // Seconds-string -> M:SS.mmm clock (e.g. "23.456" -> "0:23.456", "85.2" -> "1:25.200").
+        private static string FmtClock(string raw)
+        {
+            float t = ParseTime(raw);
+            if (t < 0f) return FmtLap(raw);
+            int mins = (int)(t / 60f);
+            float secs = t - mins * 60f;
+            return string.Format(CultureInfo.InvariantCulture, "{0}:{1:00.000}", mins, secs);
         }
 
         private static string Pb(int best)
@@ -2776,12 +5040,50 @@ namespace LobbyOverlay
             labelStyle.fontSize = Sci(19);
             labelStyle.normal.textColor = new Color(0.80f, 0.84f, 0.92f);
 
+            // Mode-bar "Best time:" line: plain white, left-aligned, sits under the buttons.
+            bestStyle = new GUIStyle(labelStyle);
+            bestStyle.normal.textColor = Color.white;
+            bestStyle.alignment = TextAnchor.MiddleLeft;
+            bestStyle.margin = ScRO(2, 0, 4, 0);
+
             valueStyle = new GUIStyle(GUI.skin.label);
             if (uiFont != null) valueStyle.font = uiFont;
             valueStyle.fontSize = Sci(19);
             valueStyle.fontStyle = FontStyle.Bold;
             valueStyle.normal.textColor = Color.white;
             valueStyle.alignment = TextAnchor.MiddleRight;
+
+            // Showdown score box. wordWrap is OFF everywhere here: a wrapped team tag rendered as
+            // "STB / N" and a wrapped map name ate two lines of the card.
+            sdTagStyle = new GUIStyle(GUI.skin.label);
+            if (uiFont != null) sdTagStyle.font = uiFont;
+            sdTagStyle.fontSize = Sci(25);
+            sdTagStyle.fontStyle = FontStyle.Bold;
+            sdTagStyle.normal.textColor = Color.white;
+            sdTagStyle.alignment = TextAnchor.MiddleLeft;
+            sdTagStyle.wordWrap = false;
+            sdTagStyle.clipping = TextClipping.Overflow;
+
+            sdScoreStyle = new GUIStyle(sdTagStyle);
+            sdScoreStyle.alignment = TextAnchor.MiddleCenter;
+            sdScoreStyle.margin = ScRO(10, 10, 0, 0);
+
+            // Map / round line under the tags, and the racer-name column.
+            sdSubStyle = new GUIStyle(GUI.skin.label);
+            if (uiFont != null) sdSubStyle.font = uiFont;
+            sdSubStyle.fontSize = Sci(17);
+            sdSubStyle.normal.textColor = dimColor;
+            sdSubStyle.alignment = TextAnchor.MiddleLeft;
+            sdSubStyle.wordWrap = false;
+            sdSubStyle.clipping = TextClipping.Overflow;
+
+            sdNameStyle = new GUIStyle(GUI.skin.label);
+            if (uiFont != null) sdNameStyle.font = uiFont;
+            sdNameStyle.fontSize = Sci(19);
+            sdNameStyle.normal.textColor = Color.white;
+            sdNameStyle.alignment = TextAnchor.MiddleLeft;
+            sdNameStyle.wordWrap = false;
+            sdNameStyle.clipping = TextClipping.Overflow;
 
             // H2H comparison styles (white base, tinted per player via GUI.contentColor)
             nameLeftStyle = new GUIStyle(pnameStyle);
