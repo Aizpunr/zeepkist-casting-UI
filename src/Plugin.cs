@@ -174,7 +174,10 @@ namespace LobbyOverlay
         private MethodInfo pdPresetSetX, pdPresetSetY, pdPresetSetW, pdPresetSetH;
         private MethodInfo pdApplyPresetMI;  // PhotoDrone.ApplyPreset(DronePreset) - moves/sizes window
         private Rect droneAppliedRect;       // last window rect we applied (change-detect)
-        private float droneScale = 1f;       // VS cam size vs the card (drag its corner; persisted). <1 = smaller/faster at 4K
+        // VS cam window rect. x<0 = "never placed": it follows under the H2H card (the old pinned
+        // behaviour, a sane default). The first drag or resize freezes it into a free-floating window
+        // with its own position AND aspect (persisted) - it no longer teleports when the card moves.
+        private Rect camRect = new Rect(-1f, 0f, 0f, 0f);
         private object droneRef;             // drone instance we styled last (new ref = restyle)
         private readonly HashSet<string> droneLogged = new HashSet<string>(); // once-only log lines
 
@@ -1500,24 +1503,6 @@ namespace LobbyOverlay
             return 0;
         }
 
-        // The current lead method mapped to Showdown's four win conditions, for the broadcast row.
-        // 0 = ByAmountOfFinishers, 1 = ByCumulativeTime, 2 = ByIndividualPlacements, 3 = ByRandomSelection.
-        // -1 = undecided (nothing highlighted).
-        private int SdWinConditionIndex()
-        {
-            // Maps the current stage to Yolo's 6 wincon labels:
-            // 0 Finishers, 1 Avg Team Time, 2 Avg Qualifier Time, 3 Didn't Pick Map, 4 +5 Minutes, 5 Random.
-            switch (sdLeadMethod)
-            {
-                case "finishers": return 0;
-                case "teamAvg": return 1;
-                case "qualifier": return 2;
-                case "mapPick": return 3;
-                case "overtime": return 4;
-                default: return -1;
-            }
-        }
-
         private static string SdMethodLabel(string m)
         {
             switch (m)
@@ -2578,6 +2563,10 @@ namespace LobbyOverlay
             try { board.Clear(); } catch { }
             try { ResetLive(); } catch { }
             wrUid = null; wrHolder = ""; wrTime = ""; // forget the map WR; refetched on the next level
+            // Forget the Showdown mod's broadcast state: it described THIS lobby's match. Without this
+            // it could leak into the next lobby (wrong card for up to the TTL) and would keep the
+            // manual match controls hidden in a cast where no handshake exists.
+            sdRemote = null; sdRemoteAt = -999f; sdRemoteSigApplied = null;
         }
 
         // A round started: arm the stay-in-photomode (re)entry. The poll does the actual entering once
@@ -3164,15 +3153,29 @@ namespace LobbyOverlay
         // Move/size the drone window via the same preset path PhotoDrone's own SetRect command
         // uses: pixels, origin top-left, y growing down (same convention as our IMGUI rects).
         // The preset is captured from the live drone, so mode/target are reapplied unchanged.
-        // Where/how big the VS cam window should be: pinned under the card (the Sc(40) gap hosts the
-        // "VS CAM" title bar), sized to the card times droneScale so the caster can shrink it for
-        // performance at high resolutions (rendering a smaller viewport is cheaper).
+        // Where/how big the VS cam window should be. Placed (dragged/resized at least once) -> its own
+        // free rect, untouched by any other UI. Unplaced -> follows under the card (the Sc(40) gap
+        // hosts the "VS CAM" title bar) so it lands somewhere sensible out of the box.
         private Rect DroneWantRect()
         {
+            if (camRect.x >= 0f && camRect.width > 1f) return camRect;
             return new Rect(cardDrawRect.x,
                             cardDrawRect.y + cardDrawRect.height + Sc(40f),
-                            cardDrawRect.width * droneScale,
-                            cardDrawRect.height * droneScale);
+                            cardDrawRect.width,
+                            cardDrawRect.height);
+        }
+
+        // Freeze the follow-the-card default into a free rect (first grab of either cam grip).
+        private void CamFreeze()
+        {
+            if (camRect.x < 0f && droneAppliedRect.width > 0f) camRect = droneAppliedRect;
+        }
+
+        // Push the cam's current rect to the PhotoDrone window immediately (live during a drag).
+        private void ApplyCamNow()
+        {
+            Rect nr = DroneWantRect();
+            if (droneRef != null && ApplyDroneRect(droneRef, nr)) droneAppliedRect = nr;
         }
 
         // Is the VS cam PiP currently up (so its resize grip should be live/drawn)?
@@ -3635,7 +3638,8 @@ namespace LobbyOverlay
         // SdRefresh; this only formats. Styles are built once, lazily.
         private GUIStyle sdBcScore, sdBcRound, sdBcTeam, sdBcTeamR, sdBcRank, sdBcAvg, sdBcAvgLbl,
                          sdBcWincon, sdBcName, sdBcTime, sdBcPos, sdBcSdTitle,
-                         sdBcPipLbl, sdBcMove, sdBcNote, sdBcMetric, sdBcMetricWord, sdBcDiff, sdBcTeamName;
+                         sdBcPipLbl, sdBcMove, sdBcNote, sdBcMetric, sdBcMetricWord, sdBcDiff, sdBcTeamName,
+                         sdBcMetricL, sdBcMetricWordL;
 
         private void EnsureSdBcStyles()
         {
@@ -3665,6 +3669,8 @@ namespace LobbyOverlay
             sdBcNote = new GUIStyle(sdBcScore); sdBcNote.fontSize = Sci(12); sdBcNote.fontStyle = FontStyle.Bold; sdBcNote.alignment = TextAnchor.MiddleRight; sdBcNote.normal.textColor = dimColor;
             sdBcMetric = new GUIStyle(sdBcScore); sdBcMetric.fontSize = Sci(28); sdBcMetric.alignment = TextAnchor.MiddleRight;
             sdBcMetricWord = new GUIStyle(sdBcMetric); sdBcMetricWord.fontSize = Sci(20);
+            sdBcMetricL = new GUIStyle(sdBcMetric); sdBcMetricL.alignment = TextAnchor.MiddleLeft;
+            sdBcMetricWordL = new GUIStyle(sdBcMetricWord); sdBcMetricWordL.alignment = TextAnchor.MiddleLeft;
             sdBcDiff = new GUIStyle(sdBcScore); sdBcDiff.fontSize = Sci(18); sdBcDiff.fontStyle = FontStyle.Bold; sdBcDiff.alignment = TextAnchor.MiddleRight;
             sdBcTeamName = new GUIStyle(sdBcScore); sdBcTeamName.fontSize = Sci(24); sdBcTeamName.alignment = TextAnchor.MiddleLeft; sdBcTeamName.normal.textColor = Color.white;
         }
@@ -3714,18 +3720,20 @@ namespace LobbyOverlay
         {
             EnsureSdBcStyles();
 
-            float W = Sc(940f), Wb = Sc(560f);
-            float bannerH = Sc(76f), pipsH = Sc(40f), winconH = Sc(28f), teamH = Sc(100f);
-            float gap = Sc(8f), bigGap = Sc(16f), panelPad = Sc(12f);
+            float W = Sc(940f), Wb = Sc(560f);       // header block (banner + pips) keeps its width
+            float Wc = Sc(380f);                     // team card: narrow, teams stacked vertically
+            float bannerH = Sc(76f), pipsH = Sc(40f), blockH = Sc(142f);
+            float gap = Sc(8f), bigGap = Sc(16f), panelPad = Sc(12f), teamGap = Sc(10f);
             float headerH = bannerH + gap + pipsH;
-            float panelH = panelPad + winconH + gap + 2f * teamH + gap + panelPad;
+            float panelH = panelPad + 2f * blockH + teamGap + panelPad;
 
-            float ccx = (Screen.width - W) * 0.5f;   // screen-centred default for both blocks
-            if (sdRect.x < 0f) { sdRect.x = ccx; sdRect.y = Sc(16f); }                       // header: top-centre
-            if (sdCardRect.x < 0f) { sdCardRect.x = ccx; sdCardRect.y = sdRect.y + headerH + bigGap; } // card: just below
+            float ccx = (Screen.width - W) * 0.5f;   // each block centres on its OWN width
+            float ccxC = (Screen.width - Wc) * 0.5f;
+            if (sdRect.x < 0f) { sdRect.x = ccx; sdRect.y = Sc(16f); }                        // header: top-centre
+            if (sdCardRect.x < 0f) { sdCardRect.x = ccxC; sdCardRect.y = sdRect.y + headerH + bigGap; } // card: just below
 
             sdRect.width = W; sdRect.height = headerH;
-            sdCardRect.width = W; sdCardRect.height = panelH;
+            sdCardRect.width = Wc; sdCardRect.height = panelH;
             cardDrawRect = sdRect;
 
             // ---- HEADER: score banner (centred within the block) + Bo3 pips ----
@@ -3734,8 +3742,8 @@ namespace LobbyOverlay
             SdBcBanner(banner);
             SdBcPips(pips);
 
-            // ---- CARD: wincon row + the two team-time rows ----
-            Rect panel = new Rect(sdCardRect.x, sdCardRect.y, W, panelH);
+            // ---- CARD: a stacked block per team (leader on top) ----
+            Rect panel = new Rect(sdCardRect.x, sdCardRect.y, Wc, panelH);
 
             bool aTop; int move1, move2;
             SdArrows(out aTop, out move1, out move2);
@@ -3748,11 +3756,9 @@ namespace LobbyOverlay
 
             GUI.Box(panel, GUIContent.none, boxStyle);
             float py = panel.y + panelPad;
-            SdBcWinconRow(new Rect(panel.x + Sc(16f), py, W - Sc(32f), winconH));
-            py += winconH + gap;
-            SdBcTeamRow(new Rect(panel.x, py, W, teamH), 1, t1, move1, m1, n1, d1);
-            py += teamH + gap;
-            SdBcTeamRow(new Rect(panel.x, py, W, teamH), 2, t2, move2, m2, n2, d2);
+            SdBcTeamBlock(new Rect(panel.x, py, Wc, blockH), t1, move1, m1, n1, d1);
+            py += blockH + teamGap;
+            SdBcTeamBlock(new Rect(panel.x, py, Wc, blockH), t2, move2, m2, n2, d2);
         }
 
         // Movement arrows are a transient cue, not a permanent badge: they appear only for
@@ -3846,56 +3852,48 @@ namespace LobbyOverlay
             }
         }
 
-        private void SdBcWinconRow(Rect r)
-        {
-            int active = SdWinConditionIndex();
-            string[] wc = { "Finishers", "Avg Team Time", "Avg Qualifier Time", "Didn't Pick Map", "+5 Minutes", "Random" };
-            System.Text.StringBuilder sb = new System.Text.StringBuilder();
-            sb.Append("<color=#ffffff>Wincons:</color>  ");
-            for (int i = 0; i < wc.Length; i++)
-            {
-                if (i > 0) sb.Append("<color=#5a6070>  /  </color>");
-                if (i == active) sb.Append("<b><color=#f59e0b>").Append(wc[i]).Append("</color></b>");
-                else sb.Append("<color=#8890a0>").Append(wc[i]).Append("</color>");
-            }
-            GUI.Label(r, sb.ToString(), sdBcWincon);
-        }
-
-        // One leaderboard row, laid out as Yolo's spec: movement | rank | team(logo+name) | players
-        // (2 lines: place, name, time) | deciding metric + note | diff box. move: +1 up/green, -1
-        // down/red, 0 tie/grey. metric/note/diff come from the current wincon stage (SdComputeMetrics).
-        private void SdBcTeamRow(Rect r, int rank, SdTeam t, int move, string metric, string note, float diff)
+        // One stacked team block (aizpun's broadcast sketch): logo + name header, the deciding
+        // metric line, then a row per player. Replaces the old wide side-by-side row - at 940px the
+        // card ate half the stream; stacked it hugs a corner. move: +1 up/green, -1 down/red, 0 none.
+        private void SdBcTeamBlock(Rect r, SdTeam t, int move, string metric, string note, float diff)
         {
             Color tc = SdOnDark(t.Col);
-            SdFill(r, new Color(t.Col.r, t.Col.g, t.Col.b, 0.13f));       // team-colour row tint
-            SdFill(new Rect(r.x, r.y + Sc(6f), Sc(4f), r.height - Sc(12f)), tc); // colour spine
+            SdFill(r, new Color(t.Col.r, t.Col.g, t.Col.b, 0.13f));       // team-colour tint
+            SdFill(new Rect(r.x, r.y + Sc(4f), Sc(4f), r.height - Sc(8f)), tc); // colour spine
 
-            // Fixed column widths; the players column takes the slack in the middle so names never crowd
-            // the times. The metric column is the rightmost block and stacks the deciding value with its
-            // note or the +diff underneath, all right-aligned in one column (no floating box).
-            float moveW = Sc(48f), rankW = Sc(52f), teamW = Sc(206f), metricW = Sc(190f);
-            float mx = r.x + Sc(6f);
-            Rect moveR = new Rect(mx, r.y, moveW, r.height);
-            Rect rankR = new Rect(moveR.xMax, r.y, rankW, r.height);
-            Rect teamR = new Rect(rankR.xMax, r.y, teamW, r.height);
-            Rect metricR = new Rect(r.xMax - metricW - Sc(16f), r.y, metricW, r.height);
-            Rect playersR = new Rect(teamR.xMax + Sc(10f), r.y, metricR.x - teamR.xMax - Sc(20f), r.height);
+            float pad = Sc(14f);
+            float headH = Sc(46f), metH = Sc(34f), rowH = Sc(26f);
+            float y = r.y + Sc(4f);
 
-            // Movement arrow (blank unless the lead just changed - see SdArrows).
-            GUI.contentColor = move > 0 ? goodColor : (move < 0 ? elimColor : dimColor);
-            GUI.Label(moveR, move > 0 ? "^" : (move < 0 ? "v" : ""), sdBcMove);
-            // Rank.
-            GUI.contentColor = rank == 1 ? tc : dimColor;
-            GUI.Label(rankR, "#" + rank, sdBcRank);
-            GUI.contentColor = Color.white;
-
-            // Team: logo + name.
-            Rect logo = new Rect(teamR.x + Sc(6f), teamR.y + Sc(12f), Sc(64f), teamR.height - Sc(24f));
+            // Header: logo + team name, the transient lead arrow on the right edge.
+            Rect logo = new Rect(r.x + pad, y + Sc(5f), Sc(36f), Sc(36f));
             if (!SdDrawLogo(t, logo)) SdFill(logo, t.Col);
-            GUI.Label(new Rect(logo.xMax + Sc(10f), teamR.y, teamR.xMax - logo.xMax - Sc(12f), teamR.height),
+            GUI.Label(new Rect(logo.xMax + Sc(10f), y, r.xMax - logo.xMax - Sc(58f), headH),
                       SdBannerLabel(t), sdBcTeamName);
+            GUI.contentColor = move > 0 ? goodColor : (move < 0 ? elimColor : dimColor);
+            GUI.Label(new Rect(r.xMax - Sc(44f), y, Sc(36f), headH), move > 0 ? "▲" : (move < 0 ? "▼" : ""), sdBcMove);
+            GUI.contentColor = Color.white;
+            y += headH;
 
-            // Players: two lines, ordered by real finish position.
+            // Metric line: the deciding value on the left, the winner's note or the loser's +diff
+            // right-aligned on the same line (a team shows one or the other, never both).
+            GUI.contentColor = tc;
+            GUI.Label(new Rect(r.x + pad, y, r.width * 0.55f, metH),
+                      metric, sdMetricWord ? sdBcMetricWordL : sdBcMetricL);
+            if (diff >= 0f)
+            {
+                GUI.Label(new Rect(r.xMax - pad - Sc(120f), y + Sc(6f), Sc(120f), Sc(22f)),
+                          "+" + diff.ToString("0.000", CultureInfo.InvariantCulture), sdBcDiff);
+            }
+            else
+            {
+                GUI.contentColor = string.IsNullOrEmpty(note) ? dimColor : sdActiveCol;
+                GUI.Label(new Rect(r.xMax - pad - Sc(150f), y + Sc(9f), Sc(150f), Sc(16f)), note, sdBcNote);
+            }
+            GUI.contentColor = Color.white;
+            y += metH;
+
+            // Players, ordered by real finish position: [#pos] name ........ time
             List<SdPlayer> ps = new List<SdPlayer>(t.Players);
             ps.Sort(delegate (SdPlayer a, SdPlayer b)
             {
@@ -3903,42 +3901,23 @@ namespace LobbyOverlay
                 int pb = SdFinishPos(b); if (pb == 0) pb = 99;
                 return pa.CompareTo(pb);
             });
-            float subH = playersR.height / 2f;
             for (int i = 0; i < ps.Count && i < 2; i++)
             {
                 SdPlayer p = ps[i];
-                Rect row = new Rect(playersR.x, playersR.y + i * subH, playersR.width, subH);
-                if (i == 0) SdFill(new Rect(row.x, row.yMax, row.width, Sc(1f)), new Color(1f, 1f, 1f, 0.08f));
+                Rect row = new Rect(r.x + pad, y + i * rowH, r.width - 2f * pad, rowH);
+                if (i > 0) SdFill(new Rect(row.x, row.y, row.width, Sc(1f)), new Color(1f, 1f, 1f, 0.08f));
                 int pos = SdFinishPos(p);
-                float timeW = Sc(120f), posW = Sc(34f);
+                float timeW = Sc(110f), posW = Sc(30f);
                 GUI.contentColor = tc;
                 GUI.Label(new Rect(row.x, row.y, posW, row.height), pos > 0 ? ("#" + pos) : "", sdBcPos);
                 GUI.contentColor = Color.white;
-                GUI.Label(new Rect(row.x + posW + Sc(8f), row.y, row.width - posW - timeW - Sc(16f), row.height),
+                GUI.Label(new Rect(row.x + posW + Sc(6f), row.y, row.width - posW - timeW - Sc(12f), row.height),
                           SdShortName(p), sdBcName);
                 float lt = SdLiveTime(p);
                 GUI.contentColor = lt >= 0f ? tc : dimColor;
                 GUI.Label(new Rect(row.xMax - timeW, row.y, timeW, row.height), lt >= 0f ? SdTime(lt) : "--:--.---", sdBcTime);
                 GUI.contentColor = Color.white;
             }
-
-            // Deciding metric, with either the winner's note or the loser's +diff aligned directly
-            // beneath it in the same right-hand column (a team shows one or the other, never both).
-            GUI.contentColor = tc;
-            GUI.Label(new Rect(metricR.x, metricR.y + Sc(12f), metricR.width, Sc(42f)),
-                      metric, sdMetricWord ? sdBcMetricWord : sdBcMetric);
-            if (diff >= 0f)
-            {
-                GUI.contentColor = tc;
-                GUI.Label(new Rect(metricR.x, metricR.yMax - Sc(30f), metricR.width, Sc(22f)),
-                          "+" + diff.ToString("0.000", CultureInfo.InvariantCulture), sdBcDiff);
-            }
-            else
-            {
-                GUI.contentColor = string.IsNullOrEmpty(note) ? dimColor : sdActiveCol;
-                GUI.Label(new Rect(metricR.x, metricR.yMax - Sc(26f), metricR.width, Sc(16f)), note, sdBcNote);
-            }
-            GUI.contentColor = Color.white;
         }
 
         // ---- Showdown score box --------------------------------------------------------------------
@@ -4192,7 +4171,11 @@ namespace LobbyOverlay
             if (showPanel || mode != Mode.None) DrawGrip(barRect, hs);
             if (castMode == CastMode.Showdown && sdRect.width > 0f) DrawGrip(sdRect, hs);
             if (castMode == CastMode.Showdown && sdCardRect.width > 0f) DrawGrip(sdCardRect, hs);
-            if (VsCamUp()) DrawResizeGrip(droneAppliedRect, hs); // VS cam: resize (not move - it's pinned)
+            if (VsCamUp())
+            {
+                DrawGripBL(droneAppliedRect, hs);       // bottom-left: move (frees it from the card)
+                DrawResizeGrip(droneAppliedRect, hs);   // bottom-right: resize, free aspect
+            }
         }
 
         // Resize grip in the VS cam's bottom-right corner: a faint square with a diagonal staircase of
@@ -4235,6 +4218,30 @@ namespace LobbyOverlay
         private Rect GripRect(Rect box, float hs)
         {
             return new Rect(box.xMax - hs - Sc(3f), box.yMax - hs - Sc(3f), hs, hs);
+        }
+
+        // Bottom-LEFT grip rect: the VS cam's move handle. Its bottom-right corner is the resize
+        // grip, so the move grip lives in the opposite corner.
+        private Rect GripRectBL(Rect box, float hs)
+        {
+            return new Rect(box.x + Sc(3f), box.yMax - hs - Sc(3f), hs, hs);
+        }
+
+        // DrawGrip's bottom-left twin (move affordance: accent outline on hover).
+        private void DrawGripBL(Rect box, float hs)
+        {
+            Rect g = GripRectBL(box, hs);
+            GUI.Box(g, GUIContent.none, boxStyle);
+            Vector2 m = Event.current != null ? Event.current.mousePosition : new Vector2(-1f, -1f);
+            if (!GripRectBL(box, Sc(22f)).Contains(m)) return;
+            Color prev = GUI.color;
+            GUI.color = accentCol;
+            float t = Sc(2f);
+            GUI.DrawTexture(new Rect(g.x, g.y, g.width, t), whiteTex);
+            GUI.DrawTexture(new Rect(g.x, g.yMax - t, g.width, t), whiteTex);
+            GUI.DrawTexture(new Rect(g.x, g.y, t, g.height), whiteTex);
+            GUI.DrawTexture(new Rect(g.xMax - t, g.y, t, g.height), whiteTex);
+            GUI.color = prev;
         }
 
         // HUD scale: 1.0 at 1080p, proportional at other resolutions so text/boxes keep their
@@ -4541,7 +4548,15 @@ namespace LobbyOverlay
                 }
                 else if (VsCamUp() && GripRect(droneAppliedRect, hs).Contains(e.mousePosition))
                 {
-                    draggingId = 3; // VS cam resize (no offset: scale is derived from the mouse directly)
+                    draggingId = 3; // VS cam resize (no offset: the corner tracks the mouse directly)
+                    CamFreeze();    // grabbing either grip unpins it from the card for good
+                    e.Use();
+                }
+                else if (VsCamUp() && GripRectBL(droneAppliedRect, hs).Contains(e.mousePosition))
+                {
+                    draggingId = 6; // VS cam move
+                    CamFreeze();
+                    dragOffset = new Vector2(e.mousePosition.x - camRect.x, e.mousePosition.y - camRect.y);
                     e.Use();
                 }
             }
@@ -4552,6 +4567,12 @@ namespace LobbyOverlay
                 else if (draggingId == 2) { barRect.x = e.mousePosition.x - dragOffset.x; barRect.y = e.mousePosition.y - dragOffset.y; }
                 else if (draggingId == 4) { sdRect.x = e.mousePosition.x - dragOffset.x; sdRect.y = e.mousePosition.y - dragOffset.y; }
                 else if (draggingId == 5) { sdCardRect.x = e.mousePosition.x - dragOffset.x; sdCardRect.y = e.mousePosition.y - dragOffset.y; }
+                else if (draggingId == 6)
+                {
+                    camRect.x = e.mousePosition.x - dragOffset.x;
+                    camRect.y = e.mousePosition.y - dragOffset.y;
+                    ApplyCamNow();
+                }
                 else { ResizeVsCam(e.mousePosition); }
                 e.Use();
             }
@@ -4563,16 +4584,16 @@ namespace LobbyOverlay
             }
         }
 
-        // Live VS cam resize: the dragged corner sets the width, which drives a uniform scale (the
-        // card's aspect is preserved), clamped so the window can't vanish or balloon. Applied right
-        // away so the feed and its chrome track the drag; persisted on mouse-up by SaveLayout.
+        // Live VS cam resize: the bottom-right corner tracks the mouse, so width AND height move
+        // independently - the caster picks the aspect (16:9 for a broadcast slot, square for a PiP),
+        // instead of the old uniform scale that was locked to the card's shape. Clamped so the window
+        // can't vanish or balloon. Applied right away; persisted on mouse-up by SaveLayout.
         private void ResizeVsCam(Vector2 mouse)
         {
-            if (cardDrawRect.width < 1f) return;
-            float newW = mouse.x - cardDrawRect.x; // left edge is pinned to the card
-            droneScale = Mathf.Clamp(newW / cardDrawRect.width, 0.35f, 2f);
-            Rect nr = DroneWantRect();
-            if (droneRef != null && ApplyDroneRect(droneRef, nr)) droneAppliedRect = nr;
+            if (camRect.x < 0f) return; // CamFreeze on grab makes this the normal path
+            camRect.width = Mathf.Clamp(mouse.x - camRect.x, Sc(120f), Screen.width);
+            camRect.height = Mathf.Clamp(mouse.y - camRect.y, Sc(80f), Screen.height);
+            ApplyCamNow();
         }
 
         // Persisted overlay layout (window positions + a few sticky panel choices). Property defaults
@@ -4590,7 +4611,12 @@ namespace LobbyOverlay
             public string comp { get; set; }
             public bool cam { get; set; }
             public string castmode { get; set; }
-            public float vscamScale { get; set; }
+            // VS cam free rect; w/h <= 1 (incl. layouts saved before this existed) = not placed,
+            // follow under the card.
+            public float vscamX { get; set; }
+            public float vscamY { get; set; }
+            public float vscamW { get; set; }
+            public float vscamH { get; set; }
             public float sdX { get; set; }
             public float sdY { get; set; }
             public float sdCardX { get; set; }
@@ -4601,7 +4627,7 @@ namespace LobbyOverlay
                 panelX = -1f; panelY = 130f;
                 barX = -1f; barY = 0f;
                 comp = "cotd"; cam = true; castmode = "cup";
-                vscamScale = 1f;
+                vscamX = -1f; vscamY = 0f; vscamW = 0f; vscamH = 0f;
                 sdX = -1f; sdY = 0f;
                 sdCardX = -1f; sdCardY = 0f;
             }
@@ -4645,7 +4671,11 @@ namespace LobbyOverlay
             castMode = cm == "topout" ? CastMode.Topout
                      : (cm == "pursuit" ? CastMode.Pursuit
                      : (cm == "showdown" ? CastMode.Showdown : CastMode.Cup));
-            droneScale = d.vscamScale > 0f ? Mathf.Clamp(d.vscamScale, 0.35f, 2f) : 1f;
+            // Sanity: a saved rect needs a real size to be trusted; anything else falls back to the
+            // follow-the-card default (also what layouts saved before the free-cam change load as).
+            camRect = (d.vscamW > 1f && d.vscamH > 1f)
+                ? new Rect(d.vscamX, d.vscamY, d.vscamW, d.vscamH)
+                : new Rect(-1f, 0f, 0f, 0f);
             if (!availableComps.Contains(selectedComp)) selectedComp = "cotd";
         }
 
@@ -4661,7 +4691,7 @@ namespace LobbyOverlay
                 d.sdX = sdRect.x; d.sdY = sdRect.y;
                 d.sdCardX = sdCardRect.x; d.sdCardY = sdCardRect.y;
                 d.comp = selectedComp; d.cam = camLink; d.castmode = CastLabel(castMode).ToLowerInvariant();
-                d.vscamScale = droneScale;
+                d.vscamX = camRect.x; d.vscamY = camRect.y; d.vscamW = camRect.width; d.vscamH = camRect.height;
                 Storage.SaveToJson(LayoutFile, d);
             }
             catch { }
@@ -4677,7 +4707,7 @@ namespace LobbyOverlay
             barRect.x = -1f; barRect.y = 0f;       // mode bar: x<0 -> bottom-left
             sdRect.x = -1f; sdRect.y = 0f;         // Showdown header: x<0 -> top-centre default
             sdCardRect.x = -1f; sdCardRect.y = 0f; // Showdown times card: x<0 -> centred below the header
-            droneScale = 1f;                       // VS cam back to card size
+            camRect = new Rect(-1f, 0f, 0f, 0f);   // VS cam: back to following under the card
             SaveLayout();
         }
 
@@ -4807,41 +4837,54 @@ namespace LobbyOverlay
                 return;
             }
 
-            // Score: click a team to give it a point, right-click to take one back.
-            GUILayout.BeginHorizontal();
-            int ca = LeftRightClick("+1 " + sdA.Tag, buttonStyle);
-            if (ca == 1) sdPtsA++; else if (ca == 2 && sdPtsA > 0) sdPtsA--;
-            int cb = LeftRightClick("+1 " + sdB.Tag, buttonStyle);
-            if (cb == 1) sdPtsB++; else if (cb == 2 && sdPtsB > 0) sdPtsB--;
-            GUILayout.EndHorizontal();
-
-            // Who picked the map currently up: cycles A -> B -> random -> unset.
-            GUILayout.BeginHorizontal();
-            string pickLbl = sdPickerRandom ? "random"
-                           : (string.IsNullOrEmpty(sdPickerTag) ? "-" : sdPickerTag);
-            if (GUILayout.Button("Pick: " + pickLbl + " ▸", buttonStyle)) SdCyclePicker();
-            GUILayout.EndHorizontal();
-
-            // Move the selected player between teams (covers a late substitute with zero typing).
-            if (selected.Count == 1)
+            // Once the Showdown mod's handshake has spoken this lobby, IT owns score / picker / rosters /
+            // sides - the manual buttons would be silently overwritten by the next broadcast, which reads
+            // as "the buttons are broken". So they hide, replaced by a one-line source note. They come
+            // back automatically in fallback casts (host without the broadcasting build).
+            if (sdRemote != null)
             {
+                GUI.contentColor = dimColor;
+                GUILayout.Label("match state: Showdown mod (auto)", sdSubStyle);
+                GUI.contentColor = Color.white;
+            }
+            else
+            {
+                // Score: click a team to give it a point, right-click to take one back.
                 GUILayout.BeginHorizontal();
-                if (GUILayout.Button("→ " + sdA.Tag, buttonStyle)) SdMoveSid(selected[0].Sid, sdA);
-                if (GUILayout.Button("→ " + sdB.Tag, buttonStyle)) SdMoveSid(selected[0].Sid, sdB);
+                int ca = LeftRightClick("+1 " + sdA.Tag, buttonStyle);
+                if (ca == 1) sdPtsA++; else if (ca == 2 && sdPtsA > 0) sdPtsA--;
+                int cb = LeftRightClick("+1 " + sdB.Tag, buttonStyle);
+                if (cb == 1) sdPtsB++; else if (cb == 2 && sdPtsB > 0) sdPtsB--;
+                GUILayout.EndHorizontal();
+
+                // Who picked the map currently up: cycles A -> B -> random -> unset.
+                GUILayout.BeginHorizontal();
+                string pickLbl = sdPickerRandom ? "random"
+                               : (string.IsNullOrEmpty(sdPickerTag) ? "-" : sdPickerTag);
+                if (GUILayout.Button("Pick: " + pickLbl + " ▸", buttonStyle)) SdCyclePicker();
+                GUILayout.EndHorizontal();
+
+                // Move the selected player between teams (covers a late substitute with zero typing).
+                if (selected.Count == 1)
+                {
+                    GUILayout.BeginHorizontal();
+                    if (GUILayout.Button("→ " + sdA.Tag, buttonStyle)) SdMoveSid(selected[0].Sid, sdA);
+                    if (GUILayout.Button("→ " + sdB.Tag, buttonStyle)) SdMoveSid(selected[0].Sid, sdB);
+                    GUILayout.EndHorizontal();
+                }
+
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button("New match", buttonStyle))
+                {
+                    sdPtsA = 0; sdPtsB = 0; sdScored.Clear(); sdWinSeq.Clear(); sdPickerTag = null; sdPickerRandom = false;
+                }
+                if (GUILayout.Button(sdMatchupForced ? "Auto teams" : "Swap sides", buttonStyle))
+                {
+                    if (sdMatchupForced) { sdMatchupForced = false; sdRosterSig = null; SdDetectMatchup(true); }
+                    else { SdTeam t = sdA; sdA = sdB; sdB = t; int p = sdPtsA; sdPtsA = sdPtsB; sdPtsB = p; }
+                }
                 GUILayout.EndHorizontal();
             }
-
-            GUILayout.BeginHorizontal();
-            if (GUILayout.Button("New match", buttonStyle))
-            {
-                sdPtsA = 0; sdPtsB = 0; sdScored.Clear(); sdWinSeq.Clear(); sdPickerTag = null; sdPickerRandom = false;
-            }
-            if (GUILayout.Button(sdMatchupForced ? "Auto teams" : "Swap sides", buttonStyle))
-            {
-                if (sdMatchupForced) { sdMatchupForced = false; sdRosterSig = null; SdDetectMatchup(true); }
-                else { SdTeam t = sdA; sdA = sdB; sdB = t; int p = sdPtsA; sdPtsA = sdPtsB; sdPtsB = p; }
-            }
-            GUILayout.EndHorizontal();
 
             // "Show all": a PhotoDrone per racer in a 2x2. Slots with no racer are simply not created,
             // so a 3-player lobby shows 3 feeds and a 2-player one shows 2.
