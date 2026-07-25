@@ -222,6 +222,14 @@ namespace LobbyOverlay
         private GUIStyle centerStyle;
         private GUIStyle valLeftStyle;
         private GUIStyle valRightStyle;
+        // Number hierarchy: headline / default (valueStyle) / demoted. See EnsureStyles.
+        private GUIStyle valueBigStyle;
+        private GUIStyle valueSmallStyle;
+        private GUIStyle labelSmallStyle;
+        private GUIStyle valBigLeftStyle;
+        private GUIStyle valBigRightStyle;
+        private GUIStyle valSmallLeftStyle;
+        private GUIStyle valSmallRightStyle;
         private GUIStyle buttonStyle;
         private GUIStyle buttonSelStyle;
         private Color goodColor = new Color(0.55f, 1f, 0.6f);
@@ -1837,8 +1845,7 @@ namespace LobbyOverlay
                     sdCurMap != null ? ("#" + sdCurMap.N + " " + sdCurMap.Name) : "off-pool map",
                     SdTeamSource()));
                 ChatApi.AddLocalMessage(string.Format("avg: {0} {1}  |  {2} {3}",
-                    sdA.Tag, sdAvgA >= 0f ? sdAvgA.ToString("0.000", CultureInfo.InvariantCulture) : "--",
-                    sdB.Tag, sdAvgB >= 0f ? sdAvgB.ToString("0.000", CultureInfo.InvariantCulture) : "--"));
+                    sdA.Tag, SdTime(sdAvgA), sdB.Tag, SdTime(sdAvgB)));
                 return;
             }
 
@@ -3558,7 +3565,7 @@ namespace LobbyOverlay
                 }
                 if (fName != null && fName.Length > 18) fName = fName.Substring(0, 17) + "..";
                 barBestLine = fBest >= 0f
-                    ? ("Fastest: " + (fName ?? "?") + " - " + fBest.ToString("0.000", CultureInfo.InvariantCulture))
+                    ? ("Fastest: " + (fName ?? "?") + " - " + SdTime(fBest))
                     : "Fastest: -";
                 string wrH = wrHolder;
                 if (wrH != null && wrH.Length > 18) wrH = wrH.Substring(0, 17) + "..";
@@ -4079,8 +4086,7 @@ namespace LobbyOverlay
             GUI.contentColor = col;
             GUILayout.Label(t.Tag, sdNameStyle, GUILayout.Width(Sc(96f)));
             GUI.contentColor = avg >= 0f ? Color.white : dimColor;
-            GUILayout.Label(avg >= 0f ? avg.ToString("0.000", CultureInfo.InvariantCulture) : "--",
-                valueStyle, GUILayout.Width(Sc(100f)));
+            GUILayout.Label(SdTime(avg), valueStyle, GUILayout.Width(Sc(100f)));
             GUI.contentColor = gap > 0f ? elimColor : dimColor;
             GUILayout.Label(gap > 0f ? ("+" + gap.ToString("0.000", CultureInfo.InvariantCulture)) : "",
                 valueStyle, GUILayout.Width(Sc(96f)));
@@ -4104,7 +4110,7 @@ namespace LobbyOverlay
                 string psid = SdActiveSid(p);
                 if (string.IsNullOrEmpty(psid) || !sdPb.TryGetValue(psid, out pb)) pb = -1f;
 
-                string timeStr = live >= 0f ? live.ToString("0.000", CultureInfo.InvariantCulture) : "--";
+                string timeStr = SdTime(live); // M:SS.mmm like the game ("--" when no time yet)
                 string dStr = "PB --";
                 Color dCol = dimColor;
                 if (live >= 0f && pb >= 0f)
@@ -4113,7 +4119,7 @@ namespace LobbyOverlay
                     dStr = "PB " + (d >= 0f ? "+" : "-") + Mathf.Abs(d).ToString("0.00", CultureInfo.InvariantCulture);
                     dCol = d < 0f ? goodColor : (d > 0f ? elimColor : dimColor);
                 }
-                else if (pb >= 0f) { dStr = "PB " + pb.ToString("0.000", CultureInfo.InvariantCulture); }
+                else if (pb >= 0f) { dStr = "PB " + SdTime(pb); }
 
                 GUILayout.BeginHorizontal(GUILayout.Height(Sc(26f)));
                 GUI.contentColor = col;
@@ -4137,8 +4143,7 @@ namespace LobbyOverlay
             GUI.contentColor = dimColor;
             GUILayout.Label("avg", sdSubStyle);
             GUI.contentColor = avg >= 0f ? col : dimColor;
-            GUILayout.Label(avg >= 0f ? avg.ToString("0.000", CultureInfo.InvariantCulture) : "--",
-                valueStyle, GUILayout.Width(Sc(80f)));
+            GUILayout.Label(SdTime(avg), valueStyle, GUILayout.Width(Sc(80f)));
             GUILayout.Space(Sc(96f));
             GUI.contentColor = Color.white;
             GUILayout.EndHorizontal();
@@ -5422,9 +5427,9 @@ namespace LobbyOverlay
                     GUI.contentColor = Color.white;
                     for (int i = rl.Count - 1; i >= 0; i--) // newest round first
                     {
-                        string t = TimeForRound(times, rl[i]);
-                        if (t != null) t = t.Replace(',', '.'); // logged with comma decimals
-                        Row("R" + rl[i], t);
+                        // FmtClock normalises the comma decimals COTDTracker logs AND renders the
+                        // game's M:SS.mmm, so the card matches the in-game leaderboard beside it.
+                        Row("R" + rl[i], FmtClock(TimeForRound(times, rl[i])));
                     }
                 }
             }
@@ -5489,8 +5494,7 @@ namespace LobbyOverlay
                     if (fa >= 0f && fb >= 0f) better = fa < fb ? 1 : (fb < fa ? 2 : 0);
                     else if (fa >= 0f) better = 1;
                     else if (fb >= 0f) better = 2;
-                    CompRow(sa != null ? sa.Replace(',', '.') : "-", "R" + rd,
-                            sb != null ? sb.Replace(',', '.') : "-", better);
+                    CompRow(FmtClock(sa), "R" + rd, FmtClock(sb), better);
                 }
             }
             GUILayout.EndArea();
@@ -5526,18 +5530,21 @@ namespace LobbyOverlay
             GUI.contentColor = Color.white;
             AccentLine(LineColor(s), null);
             // ELO/peak = COTD weighted, always. ELO value is tinted by its COTD tier.
-            string rankStr = s.Rank > 0 ? ("  #" + s.Rank) : "";
-            if (s.Elo > 0) RowColored("Weighted ELO", F1(s.Elo) + rankStr, TierColor(s.Elo));
+            // Weighted ELO is the card's headline: it's the one true cross-comp skill number, so it
+            // gets the big type and the rank rides along as a small suffix. Peak keeps the default
+            // size and the career totals are demoted, so the eye lands on ELO first.
+            string rankStr = s.Rank > 0 ? ("#" + s.Rank) : "";
+            if (s.Elo > 0) RowHeadline("Weighted ELO", F1(s.Elo), rankStr, TierColor(s.Elo));
             else Row("Weighted ELO", "-");
             if (s.Peak > 0) RowColored("Peak ELO", F1(s.Peak), TierColor(s.Peak));
             else Row("Peak ELO", "-");
             // wins/podiums/cups/best from the selected comp.
             GUILayout.Label(CompLabel(selectedComp) + " record", centerStyle);
             CompStat c = CompFor(s, selectedComp);
-            Row("Wins", c != null ? c.Wins.ToString() : "-");
-            Row(CompUsesFinalists(selectedComp) ? "Finalists" : "Podiums", c != null ? SecondStatValue(c).ToString() : "-");
-            Row("Cups", c != null ? c.Cups.ToString() : "-");
-            Row("Best finish", (c != null && c.Best > 0) ? ("#" + c.Best) : "-");
+            RowSmall("Wins", c != null ? c.Wins.ToString() : "-");
+            RowSmall(CompUsesFinalists(selectedComp) ? "Finalists" : "Podiums", c != null ? SecondStatValue(c).ToString() : "-");
+            RowSmall("Cups", c != null ? c.Cups.ToString() : "-");
+            RowSmall("Best finish", (c != null && c.Best > 0) ? ("#" + c.Best) : "-");
             GUILayout.EndArea();
         }
 
@@ -5560,6 +5567,36 @@ namespace LobbyOverlay
             GUI.contentColor = valueColor;
             GUILayout.Label(value, valueStyle);
             GUI.contentColor = prev;
+            GUILayout.EndHorizontal();
+        }
+
+        // The card's headline number: big and tier-coloured, with an optional smaller, dimmer suffix
+        // (the rank) parked in front of it. IMGUI can't mix font sizes inside a single Label, so the
+        // suffix has to be its own label.
+        private void RowHeadline(string label, string value, string suffix, Color valueColor)
+        {
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(label, labelStyle);
+            GUILayout.FlexibleSpace();
+            Color prev = GUI.contentColor;
+            if (!string.IsNullOrEmpty(suffix))
+            {
+                GUI.contentColor = dimColor;
+                GUILayout.Label(suffix, labelSmallStyle, GUILayout.ExpandWidth(false));
+            }
+            GUI.contentColor = valueColor;
+            GUILayout.Label(value, valueBigStyle, GUILayout.ExpandWidth(false));
+            GUI.contentColor = prev;
+            GUILayout.EndHorizontal();
+        }
+
+        // Demoted row: supporting numbers (career totals) that shouldn't compete with the headline.
+        private void RowSmall(string label, string value)
+        {
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(label, labelSmallStyle);
+            GUILayout.FlexibleSpace();
+            GUILayout.Label(value, valueSmallStyle);
             GUILayout.EndHorizontal();
         }
 
@@ -5599,27 +5636,32 @@ namespace LobbyOverlay
             // fastest time in the cup (lower better); slower side shows the gap
             string lapA = FastestInCup(a);
             string lapB = FastestInCup(b);
-            string dispA = FmtLap(lapA);
-            string dispB = FmtLap(lapB);
+            // Game-format clock (M:SS.mmm) so the card reads the same as the leaderboard next to it.
+            string dispA = FmtClock(lapA);
+            string dispB = FmtClock(lapB);
             float fa = ParseTime(lapA);
             float fb = ParseTime(lapB);
+            string gapStr = null;
+            int slower = 0;
             if (fa >= 0 && fb >= 0 && fa != fb)
             {
-                string gap = FmtGap(Math.Abs(fa - fb));
-                if (fa > fb) dispA = dispA + "  " + gap; else dispB = dispB + "  " + gap;
+                gapStr = FmtGap(Math.Abs(fa - fb));
+                slower = fa > fb ? 1 : 2;
             }
-            CompRow(dispA, "fastest lap", dispB, BetterTime(lapA, lapB));
+            // The live lap times are what a caster is actually reading mid-race: headline row.
+            CompRowBig(dispA, "fastest lap", dispB, BetterTime(lapA, lapB));
+            GapLine(gapStr, slower);
 
             // mutual record (more wins better) from the chosen h2h source; center shows total shared
             int w1, w2;
             MutualRecord(a, b, selectedComp, out w1, out w2);
-            CompRow(w1.ToString(), "mutual (" + (w1 + w2) + ", " + CompLabel(selectedComp) + ")", w2.ToString(),
+            CompRowSmall(w1.ToString(), "mutual (" + (w1 + w2) + ", " + CompLabel(selectedComp) + ")", w2.ToString(),
                 w1 > w2 ? 1 : (w2 > w1 ? 2 : 0));
 
             // "-" for players with no pool data (mirrors the Stats card)
-            CompRow(a.Peak > 0 ? F1(a.Peak) : "-", "peak elo",
+            CompRowSmall(a.Peak > 0 ? F1(a.Peak) : "-", "peak elo",
                     b.Peak > 0 ? F1(b.Peak) : "-", Better(a.Peak, b.Peak, true));
-            CompRow(a.Elo > 0 ? F1(a.Elo) : "-", "current elo",
+            CompRowSmall(a.Elo > 0 ? F1(a.Elo) : "-", "current elo",
                     b.Elo > 0 ? F1(b.Elo) : "-", Better(a.Elo, b.Elo, true));
             // wins/podiums/pb from the selected comp
             CompStat ca = CompFor(a, selectedComp);
@@ -5627,9 +5669,9 @@ namespace LobbyOverlay
             int aw = ca != null ? ca.Wins : 0, bw = cb != null ? cb.Wins : 0;
             int ap = SecondStatValue(ca), bp = SecondStatValue(cb);
             int ab = ca != null ? ca.Best : 0, bb = cb != null ? cb.Best : 0;
-            CompRow(aw.ToString(), CompLabel(selectedComp) + " wins", bw.ToString(), Better(aw, bw, true));
-            CompRow(ap.ToString(), SecondStatLabel(selectedComp), bp.ToString(), Better(ap, bp, true));
-            CompRow(Pb(ab), "pb", Pb(bb), BetterPb(ab, bb));
+            CompRowSmall(aw.ToString(), CompLabel(selectedComp) + " wins", bw.ToString(), Better(aw, bw, true));
+            CompRowSmall(ap.ToString(), SecondStatLabel(selectedComp), bp.ToString(), Better(ap, bp, true));
+            CompRowSmall(Pb(ab), "pb", Pb(bb), BetterPb(ab, bb));
 
             GUILayout.EndArea();
         }
@@ -5643,6 +5685,59 @@ namespace LobbyOverlay
             GUILayout.Label(label, centerStyle, GUILayout.ExpandWidth(true));
             GUI.contentColor = (better == 2) ? goodColor : dimColor;
             GUILayout.Label(right, valRightStyle, GUILayout.Width(Sc(110f)));
+            GUI.contentColor = Color.white;
+            GUILayout.EndHorizontal();
+        }
+
+        // The comparison's headline row (the live lap times). The losing side stays WHITE rather than
+        // dim: at this size it's the number the caster reads second, and dimming it hurt legibility.
+        private void CompRowBig(string left, string label, string right, int better)
+        {
+            GUILayout.BeginHorizontal();
+            GUI.contentColor = (better == 1) ? goodColor : Color.white;
+            GUILayout.Label(left, valBigLeftStyle, GUILayout.Width(Sc(130f)));
+            GUI.contentColor = Color.white;
+            GUILayout.Label(label, centerStyle, GUILayout.ExpandWidth(true));
+            GUI.contentColor = (better == 2) ? goodColor : Color.white;
+            GUILayout.Label(right, valBigRightStyle, GUILayout.Width(Sc(130f)));
+            GUI.contentColor = Color.white;
+            GUILayout.EndHorizontal();
+        }
+
+        // The gap, parked on its own line directly under the SLOWER player's time (1 = left, 2 = right)
+        // so it needs no label to be understood. It used to be appended to the time string, but at the
+        // headline font size "0:43.180  (+.455)" overran the 320px card and clipped the number itself.
+        private void GapLine(string gap, int slower)
+        {
+            if (string.IsNullOrEmpty(gap) || slower == 0) return;
+            GUILayout.BeginHorizontal();
+            if (slower == 1)
+            {
+                GUI.contentColor = elimColor;
+                GUILayout.Label(gap, valSmallLeftStyle, GUILayout.Width(Sc(130f)));
+                GUI.contentColor = Color.white;
+                GUILayout.FlexibleSpace();
+            }
+            else
+            {
+                GUILayout.FlexibleSpace();
+                GUI.contentColor = elimColor;
+                GUILayout.Label(gap, valSmallRightStyle, GUILayout.Width(Sc(130f)));
+                GUI.contentColor = Color.white;
+            }
+            GUILayout.EndHorizontal();
+        }
+
+        // Demoted comparison row: the static pool stats under the headline.
+        private void CompRowSmall(string left, string label, string right, int better)
+        {
+            GUILayout.BeginHorizontal();
+            GUI.contentColor = (better == 1) ? goodColor : dimColor;
+            GUILayout.Label(left, valSmallLeftStyle, GUILayout.Width(Sc(110f)));
+            GUI.contentColor = Color.white;
+            GUILayout.Label(label, centerStyle, GUILayout.ExpandWidth(true));
+            GUI.contentColor = (better == 2) ? goodColor : dimColor;
+            GUILayout.Label(right, valSmallRightStyle, GUILayout.Width(Sc(110f)));
             GUI.contentColor = Color.white;
             GUILayout.EndHorizontal();
         }
@@ -5852,6 +5947,32 @@ namespace LobbyOverlay
 
             valRightStyle = new GUIStyle(valueStyle);
             valRightStyle.alignment = TextAnchor.MiddleRight;
+
+            // Three tiers of number, so a card has an obvious place to look first (feedback from Yolo
+            // after a live cast: "they look all the same, I didn't know where to look"). Same scale the
+            // Showdown broadcast card already uses: one headline value, everything else demoted.
+            valueBigStyle = new GUIStyle(valueStyle);
+            valueBigStyle.fontSize = Sci(30);
+
+            valueSmallStyle = new GUIStyle(valueStyle);
+            valueSmallStyle.fontSize = Sci(16);
+
+            labelSmallStyle = new GUIStyle(labelStyle);
+            labelSmallStyle.fontSize = Sci(16);
+            labelSmallStyle.normal.textColor = new Color(0.62f, 0.66f, 0.74f);
+
+            valBigLeftStyle = new GUIStyle(valueStyle);
+            valBigLeftStyle.fontSize = Sci(26);
+            valBigLeftStyle.alignment = TextAnchor.MiddleLeft;
+
+            valBigRightStyle = new GUIStyle(valBigLeftStyle);
+            valBigRightStyle.alignment = TextAnchor.MiddleRight;
+
+            valSmallLeftStyle = new GUIStyle(valueSmallStyle);
+            valSmallLeftStyle.alignment = TextAnchor.MiddleLeft;
+
+            valSmallRightStyle = new GUIStyle(valueSmallStyle);
+            valSmallRightStyle.alignment = TextAnchor.MiddleRight;
 
             buttonStyle = new GUIStyle(GUI.skin.button);
             if (uiFont != null) buttonStyle.font = uiFont;
