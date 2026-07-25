@@ -25,6 +25,7 @@ if not exist "%OUTDIR%" mkdir "%OUTDIR%"
   -reference:"%ZEEP%\BepInEx\core\BepInEx.dll" ^
   -reference:"%MGD%\UnityEngine.dll" ^
   -reference:"%MGD%\UnityEngine.CoreModule.dll" ^
+  -reference:"%MGD%\UnityEngine.ImageConversionModule.dll" ^
   -reference:"%MGD%\UnityEngine.IMGUIModule.dll" ^
   -reference:"%MGD%\UnityEngine.UIModule.dll" ^
   -reference:"%MGD%\UnityEngine.TextRenderingModule.dll" ^
@@ -56,5 +57,8 @@ if errorlevel 1 (
 )
 copy /Y "%~dp0overlay_pool.json" "%PLUGDIR%\overlay_pool.json" >nul
 copy /Y "%~dp0showdown_pool.json" "%PLUGDIR%\showdown_pool.json" >nul
-echo Deployed DLL + overlay_pool.json + showdown_pool.json to the LobbyOverlay plugin folder.
+rem Team logos for the Showdown broadcast card. /I so xcopy treats the target as a folder unattended.
+if not exist "%PLUGDIR%\logos" mkdir "%PLUGDIR%\logos"
+xcopy /Y /I /Q "%~dp0logos\*.png" "%PLUGDIR%\logos\" >nul
+echo Deployed DLL + pools + logos to the LobbyOverlay plugin folder.
 endlocal
