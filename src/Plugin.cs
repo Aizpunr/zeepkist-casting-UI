@@ -928,7 +928,18 @@ namespace LobbyOverlay
             // The Showdown mod itself is the best source when it's live. Preferred order:
             //   1. the @SDSTATE@ handshake (full authoritative state), 2. its leaderboard colours,
             //   3. our own pool file. A caster-pinned matchup still wins over all of them.
-            if (!sdMatchupForced && SdRemoteFresh()) { SdApplyRemote(); return; }
+            // Once the Showdown mod has spoken in this lobby it stays authoritative for the whole
+            // match: broadcasts only come at state changes, so mid-round the remote is always "stale"
+            // (rounds outlive SD_REMOTE_TTL by minutes). Falling through to the colour-scrape here was
+            // a live-event bug: mid-round only FINISHERS carry a colour override, so the scrape rebuilt
+            // the teams from whoever had finished (a 1-player roster -> that racer's 4x feed died until
+            // the round-end broadcast restored the truth). Stale now only means "stop taking the score
+            // from it" (the local auto-scorer covers that); rosters keep the last broadcast state.
+            if (!sdMatchupForced && sdRemote != null)
+            {
+                if (SdRemoteFresh()) SdApplyRemote();
+                return;
+            }
             if (!sdMatchupForced && SdDetectFromOverrides()) return;
             List<ZeepkistNetworkPlayer> list;
             try { list = ZeepkistNetwork.PlayerList; } catch { return; }
