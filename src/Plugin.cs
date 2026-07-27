@@ -782,19 +782,29 @@ namespace LobbyOverlay
         // the state straight off the game's ChatMessages list (Yolo's documented fallback). Typed access;
         // we already reference Zeepkist.dll. Runs on the main thread from Update, so it feeds pendingSdState
         // the same way the events do and is consumed by the same block below.
-        private int sdChatSeen;
+        private object sdSweepLastObj; // newest ChatMessages entry already inspected by the sweep
+
+        // The game's ChatMessages is a rolling 20-entry list: every receive path does Add() then
+        // RemoveAt(0) once Count exceeds 20 (verified in the Zeepkist.dll IL). An index-based sweep
+        // goes permanently blind once the cap is hit - Count never grows past 20 again - which is how
+        // the handshake died mid-match at the S7 event the moment lobby chat filled up. So instead of
+        // an index, remember the newest message OBJECT we inspected and walk backward to it; everything
+        // after it is new. If it rolled off the list (or a clear emptied it) the window is all 20
+        // entries, and re-inspecting an already-applied @SDSTATE@ is harmless (same sig, no reset).
         private void SdPollChatMessages()
         {
             List<ZeepkistClient.ZeepkistChatMessage> msgs = ZeepkistClient.ZeepkistNetwork.ChatMessages;
-            if (msgs == null) { sdChatSeen = 0; return; }
-            int n = msgs.Count;
-            if (n < sdChatSeen) sdChatSeen = 0;   // list was cleared (e.g. new lobby) - rescan from the top
-            for (int i = sdChatSeen; i < n; i++)
+            if (msgs == null || msgs.Count == 0) { sdSweepLastObj = null; return; }
+            int stop = -1; // index of the newest already-inspected entry; -1 = none still in the list
+            if (sdSweepLastObj != null)
+                for (int i = msgs.Count - 1; i >= 0; i--)
+                    if (ReferenceEquals(msgs[i], sdSweepLastObj)) { stop = i; break; }
+            for (int i = stop + 1; i < msgs.Count; i++)
             {
                 ZeepkistClient.ZeepkistChatMessage cm = msgs[i];
                 if (cm != null && cm.Message != null) SdCaptureState(cm.Message); // newest @SDSTATE@ wins
             }
-            sdChatSeen = n;
+            sdSweepLastObj = msgs[msgs.Count - 1];
         }
 
         // Decode + parse + commit a captured payload. Silent on anything malformed - a stray chat line
@@ -933,11 +943,12 @@ namespace LobbyOverlay
             // (rounds outlive SD_REMOTE_TTL by minutes). Falling through to the colour-scrape here was
             // a live-event bug: mid-round only FINISHERS carry a colour override, so the scrape rebuilt
             // the teams from whoever had finished (a 1-player roster -> that racer's 4x feed died until
-            // the round-end broadcast restored the truth). Stale now only means "stop taking the score
-            // from it" (the local auto-scorer covers that); rosters keep the last broadcast state.
+            // the round-end broadcast restored the truth). The last broadcast is applied with no freshness
+            // check - inside a lobby it is always the best truth available, and points only change at
+            // state transitions, which each come with a broadcast of their own.
             if (!sdMatchupForced && sdRemote != null)
             {
-                if (SdRemoteFresh()) SdApplyRemote();
+                SdApplyRemote();
                 return;
             }
             if (!sdMatchupForced && SdDetectFromOverrides()) return;
@@ -1001,7 +1012,7 @@ namespace LobbyOverlay
         private string SdTeamSource()
         {
             if (sdMatchupForced) return "pinned by caster";
-            if (SdRemoteFresh() && sdRemote != null && sdA == sdRemote.A) return "Showdown mod (handshake)";
+            if (sdRemote != null && sdA == sdRemote.A) return "Showdown mod (handshake)";
             if (sdA != null && sdA == sdOvA) return "Showdown mod (colours)";
             return "showdown_pool.json";
         }
@@ -1532,7 +1543,14 @@ namespace LobbyOverlay
         private void SdTryScoreRound()
         {
             if (castMode != CastMode.Showdown || sdA == null || sdB == null) return;
-            if (SdRemoteFresh()) return; // the Showdown mod owns the score when it's broadcasting state
+            // The Showdown mod owns the score whenever its handshake is live in this lobby - not just
+            // while the last broadcast is fresh. The old freshness gate was a live-event bug: at round
+            // end the broadcast is always stale (rounds outlive the TTL), so this scorer ran on casts
+            // it was never meant for, and on a mid-match-joined client the local board is missing every
+            // time set before the join -> it awarded the round to the wrong team, flipping the score
+            // strip. The next broadcast then couldn't heal it if it was dropped. This scorer exists
+            // only for casts without a broadcasting host.
+            if (sdRemote != null) return;
             if (sdLead == 0) return; // nobody finished, or a genuine dead heat -> caster awards it
             string key = CurrentLevelHash();
             if (string.IsNullOrEmpty(key)) return;
